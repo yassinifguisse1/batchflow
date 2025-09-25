@@ -2,8 +2,16 @@ import "https://deno.land/x/xhr@0.1.0/mod.ts";
 // @ts-expect-error - Deno imports
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 
+// Add Deno type declaration for TypeScript
+interface DenoEnv {
+  get(key: string): string | undefined;
+}
 
-const openAIApiKey = process.env.OPENAI_API_KEY;
+declare const Deno: {
+  env: DenoEnv;
+};
+
+const openAIApiKey = Deno.env.get("OPENAI_API_KEY");
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
