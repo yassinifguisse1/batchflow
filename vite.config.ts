@@ -19,4 +19,10 @@ export default defineConfig(({ mode }) => ({
       "@": path.resolve(__dirname, "./src"),
     },
   },
+  build: {
+    outDir: "build",   // where Vite puts the production files
+    // sourcemap: false,
+    // target: "es2020",
+    // emptyOutDir: true,
+  }
 }));
