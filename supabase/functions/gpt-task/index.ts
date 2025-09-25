@@ -248,12 +248,14 @@ serve(async (req) => {
     });
 
     return new Response(JSON.stringify({ 
+      build: BUILD_ID,                  // <-- proves which build ran
       result,
       usage: data.usage,
       model: data.model
     }), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     });
+   
 
   } catch (error) {
     console.error('Error in gpt-task function:', error);
