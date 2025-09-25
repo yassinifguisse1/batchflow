@@ -549,7 +549,7 @@ const NodeConfigPanel: React.FC<NodeConfigPanelProps> = ({ node, onUpdate }) => 
   };
 
   const selectedWebhook = webhooks.find(w => w.id === config.selectedHook);
-  const webhookUrl = selectedWebhook ? `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/webhook-handler/${selectedWebhook.url_path}` : '';
+  const webhookUrl = selectedWebhook ? `${process.env.VITE_SUPABASE_URL}/functions/v1/webhook-handler/${selectedWebhook.url_path}` : '';
 
   const copyToClipboard = () => {
     if (webhookUrl) {

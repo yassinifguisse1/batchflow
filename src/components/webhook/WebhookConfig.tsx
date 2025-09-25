@@ -102,7 +102,7 @@ const WebhookConfig: React.FC<WebhookConfigProps> = ({ webhook, onSave, onCancel
       const formattedWebhooks = (data || []).map(webhook => ({
         id: webhook.id,
         name: webhook.name,
-        url: `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/webhook-handler/${webhook.url_path}`,
+        url: `${process.env.VITE_SUPABASE_URL}/functions/v1/webhook-handler/${webhook.url_path}`,
         url_path: webhook.url_path
       }));
 

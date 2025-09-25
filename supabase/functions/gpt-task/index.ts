@@ -1,7 +1,9 @@
 import "https://deno.land/x/xhr@0.1.0/mod.ts";
+// @ts-expect-error - Deno imports
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 
-const openAIApiKey = Deno.env.get('OPENAI_API_KEY');
+
+const openAIApiKey = process.env.OPENAI_API_KEY;
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -22,7 +24,7 @@ serve(async (req) => {
     }
 
     // Build messages array
-    const messages = [];
+    const messages: Array<{ role: string; content: string }> = [];
     
     // Add system message if provided
     if (config.systemMessage) {
@@ -117,7 +119,16 @@ serve(async (req) => {
 
     // Prepare OpenAI request payload
     const selectedModel = config.model || 'gpt-4o-mini';
-    const openAIPayload = {
+    const openAIPayload: {
+      model: string;
+      messages: Array<{ role: string; content: string }>;
+      top_p: number;
+      stream: boolean;
+      max_tokens?: number;
+      max_completion_tokens?: number;
+      temperature?: number;
+      response_format?: { type: string };
+    } = {
       model: selectedModel,
       messages,
       top_p: config.top_p || 1,
@@ -168,7 +179,7 @@ serve(async (req) => {
     }
 
     // Add timeout and retry logic for OpenAI API with longer timeout for large prompts
-    const fetchWithTimeout = async (url, options, timeoutMs = 90000, maxRetries = 3) => {
+    const fetchWithTimeout = async (url: string, options: RequestInit, timeoutMs = 90000, maxRetries = 3): Promise<Response | undefined> => {
       for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
           console.log(`GPT API attempt ${attempt}/${maxRetries}`);
@@ -205,13 +216,18 @@ serve(async (req) => {
       body: JSON.stringify(openAIPayload),
     });
 
-    if (!response.ok) {
-      const errorData = await response.json();
+    if (!response || !response.ok) {
+      const errorData = response ? await response.json() : { error: { message: 'No response from API' } };
       console.error('OpenAI API error:', errorData);
       throw new Error(`OpenAI API error: ${errorData.error?.message || 'Unknown error'}`);
     }
 
+    if (!response) {
+      throw new Error('No response received from OpenAI API');
+    }
+    
     const data = await response.json();
+    console.log('OpenAI response received:==>', data);
     const result = data.choices[0].message.content;
 
     console.log('OpenAI response received:', {
