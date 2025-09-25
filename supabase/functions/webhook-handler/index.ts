@@ -1,0 +1,2182 @@
+import "https://deno.land/x/xhr@0.1.0/mod.ts";
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.53.0';
+
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-make-apikey',
+};
+
+interface WebhookData {
+  id: string;
+  name: string;
+  url_path: string;
+  user_id: string;
+  api_keys: Array<{
+    id: string;
+    name: string;
+    key: string;
+    header: string;
+  }>;
+  workflow_data: any;
+  status: string;
+}
+
+interface WorkflowNode {
+  id: string;
+  type: string;
+  data: any;
+  position: { x: number; y: number };
+}
+
+interface WorkflowEdge {
+  id: string;
+  source: string;
+  target: string;
+}
+
+serve(async (req) => {
+  console.log('🚀 Webhook handler called!');
+  console.log('Method:', req.method);
+  console.log('URL:', req.url);
+  
+  // Handle CORS preflight requests
+  if (req.method === 'OPTIONS') {
+    console.log('Handling CORS preflight request');
+    return new Response(null, { headers: corsHeaders });
+  }
+
+  const startTime = Date.now();
+  
+  try {
+    // Initialize Supabase client
+    const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
+    const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
+    const supabase = createClient(supabaseUrl, supabaseServiceKey);
+
+    // Extract webhook path from URL
+    const url = new URL(req.url);
+    const pathSegments = url.pathname.split('/');
+    const webhookPath = pathSegments[pathSegments.length - 1]; // Get the last segment as webhook path
+
+    console.log(`Processing webhook request for path: ${webhookPath}`);
+
+    // Get request body and headers
+    let requestBody: any = {};
+    console.log('🔍 Content-Type header:', req.headers.get('content-type'));
+    console.log('🔍 Request method:', req.method);
+    
+    try {
+      const contentType = req.headers.get('content-type') || '';
+      const requestText = await req.text();
+      console.log('🔍 Raw request body:', requestText.substring(0, 500) + (requestText.length > 500 ? '...' : ''));
+      
+      // Parse body by content-type
+      if (contentType.includes('application/json')) {
+        if (requestText.trim()) {
+          try {
+            requestBody = JSON.parse(requestText);
+            console.log('✅ Parsed JSON body:', JSON.stringify(requestBody, null, 2));
+            console.log('✅ JSON body keys:', Object.keys(requestBody));
+          } catch (jsonError) {
+            console.log('❌ JSON parsing failed:', jsonError);
+            console.log('❌ Invalid JSON content:', requestText);
+            // Try to extract valid JSON if possible
+            try {
+              // Clean up common JSON issues
+              const cleanedText = requestText.replace(/,\s*}/g, '}').replace(/,\s*]/g, ']');
+              requestBody = JSON.parse(cleanedText);
+              console.log('✅ Parsed cleaned JSON body:', JSON.stringify(requestBody, null, 2));
+            } catch (secondError) {
+              console.log('❌ Even cleaned JSON parsing failed:', secondError);
+              requestBody = { raw_body: requestText };
+            }
+          }
+        } else {
+          requestBody = {};
+        }
+      } else if (
+        contentType.includes('application/x-www-form-urlencoded') ||
+        contentType.includes('multipart/form-data')
+      ) {
+        // Handle both URL-encoded and multipart form data
+        const formData = await req.formData();
+        const entries: Record<string, any> = {};
+        for (const [key, value] of formData.entries()) {
+          if (value instanceof File) {
+            // Serialize files into JSON-safe descriptors
+            entries[key] = {
+              filename: value.name,
+              type: value.type,
+              size: value.size,
+            };
+          } else {
+            entries[key] = value;
+          }
+        }
+        requestBody = entries;
+      } else if (contentType.includes('text/')) {
+        requestBody = { body: await req.text() };
+      } else {
+        // Try to parse as JSON, fallback to text
+        if (requestText.trim()) {
+          try {
+            requestBody = JSON.parse(requestText);
+          } catch {
+            requestBody = { body: requestText };
+          }
+        } else {
+          requestBody = {};
+        }
+      }
+    } catch (error) {
+      console.log('Error parsing request body:', error);
+      requestBody = {};
+    }
+
+    // Always capture query string parameters as part of the request payload
+    const queryParams = Object.fromEntries(new URL(req.url).searchParams.entries());
+    if (Object.keys(queryParams).length > 0) {
+      // Merge with body; body values take precedence over query parameters
+      const isObj = requestBody && typeof requestBody === 'object' && !Array.isArray(requestBody);
+      requestBody = {
+        ...queryParams,
+        ...(isObj ? requestBody : { body: requestBody })
+      };
+    }
+
+    const requestHeaders = Object.fromEntries(req.headers.entries());
+
+    console.log('🎯 Final request body (merged with query params if any):', JSON.stringify(requestBody, null, 2));
+    console.log('🎯 Final request body keys:', Object.keys(requestBody));
+    console.log('🎯 Request headers:', Object.keys(requestHeaders));
+    
+    // Specifically check for numbered prompt and image_size fields
+    const numberedFields = Object.keys(requestBody).filter(key => 
+      key.match(/^(prompt|image_size)\d+$/)
+    );
+    console.log('🎯 Found numbered fields:', numberedFields);
+    console.log('🎯 Numbered field values:', numberedFields.map(field => ({
+      field,
+      value: requestBody[field]
+    })));
+
+    // Find webhook configuration
+    const { data: webhook, error: webhookError } = await supabase
+      .from('webhooks')
+      .select('*')
+      .eq('url_path', webhookPath)
+      .eq('status', 'active')
+      .single();
+
+    if (webhookError || !webhook) {
+      console.error('Webhook not found:', webhookError);
+      return new Response(
+        JSON.stringify({ error: 'Webhook not found' }),
+        { 
+          status: 404, 
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
+        }
+      );
+    }
+
+    console.log('Found webhook:', webhook.name);
+
+    // Validate API key if required
+    if (webhook.api_keys && webhook.api_keys.length > 0) {
+      let isAuthorized = false;
+      
+      for (const apiKeyConfig of webhook.api_keys) {
+        const headerValue = requestHeaders[apiKeyConfig.header.toLowerCase()];
+        if (headerValue === apiKeyConfig.key) {
+          isAuthorized = true;
+          break;
+        }
+      }
+
+      if (!isAuthorized) {
+        console.error('Unauthorized: Invalid API key');
+        return new Response(
+          JSON.stringify({ error: 'Unauthorized' }),
+          { 
+            status: 401, 
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
+          }
+        );
+      }
+    }
+
+    // Find and execute workflow automatically
+    let workflowResult = { message: 'Webhook received successfully', data: requestBody, error: null };
+    
+    // Look for all workflows that use this webhook
+    const { data: workflows, error: workflowError } = await supabase
+      .from('workflows')
+      .select('*')
+      .eq('user_id', webhook.user_id)
+      .eq('status', 'active');
+
+    console.log(`Found ${workflows?.length || 0} active workflows for user`);
+
+    if (!workflowError && workflows && workflows.length > 0) {
+      // Find a workflow that has a trigger node using our webhook
+      let matchingWorkflow = null;
+      let triggerNode = null;
+      
+      for (const workflow of workflows) {
+        if (workflow.workflow_data && workflow.workflow_data.nodes) {
+          const foundTrigger = workflow.workflow_data.nodes.find((node: WorkflowNode) => 
+            node.type === 'trigger' && 
+            node.data.config?.selectedHook === webhook.id
+          );
+          
+          if (foundTrigger) {
+            matchingWorkflow = workflow;
+            triggerNode = foundTrigger;
+            break;
+          }
+        }
+      }
+      
+      if (matchingWorkflow && triggerNode) {
+        console.log(`Found matching workflow: ${matchingWorkflow.name} with trigger using webhook ${webhook.id}`);
+        console.log(`Automatically executing workflow: ${matchingWorkflow.name}`);
+        
+        try {
+          // Create webhook request first to get ID for execution tracking
+          const initialProcessingTime = Date.now() - startTime;
+          const { data: webhookRequestRecord, error: webhookRequestError } = await supabase
+            .from('webhook_requests')
+            .insert({
+              webhook_id: webhook.id,
+              request_body: requestBody,
+              request_headers: requestHeaders,
+              response_body: { message: 'Processing...', input: requestBody, originalRequest: requestBody },
+              response_status: 200,
+              processing_time_ms: initialProcessingTime
+            })
+            .select()
+            .single();
+
+          const webhookRequestId = webhookRequestRecord?.id || null;
+          console.log('✅ Created webhook request record:', webhookRequestId);
+          console.log('🎯 About to process workflow with inputData:', JSON.stringify(requestBody, null, 2));
+          console.log('🎯 InputData keys:', Object.keys(requestBody));
+          
+          // Ensure the trigger data includes the original webhook request for proper display
+          // Also expose all request body fields directly for easy parameter access
+          const enrichedTriggerData = {
+            ...requestBody, // Include all webhook request fields directly
+            originalRequest: requestBody,
+            webhookHeaders: requestHeaders,
+            webhookId: webhook.id,
+            webhookName: webhook.name,
+            // Expose common webhook fields for easy access
+            body: requestBody,
+            webhookData: {
+              id: webhook.id,
+              name: webhook.name,
+              request_body: requestBody,
+              request_headers: requestHeaders
+            }
+          };
+
+          // Process workflow with early webhook response capability
+          workflowResult = await processWorkflowWithEarlyResponse(
+            matchingWorkflow.workflow_data, 
+            enrichedTriggerData, 
+            supabase,
+            webhookRequestId,
+            matchingWorkflow.id,
+            webhook.user_id
+          );
+
+          // Update webhook request with final result
+          if (webhookRequestId) {
+            const enrichedResult = {
+              ...workflowResult,
+              input: requestBody,
+              originalRequest: requestBody,
+              webhookData: {
+                id: webhook.id,
+                name: webhook.name,
+                request_body: requestBody,
+                request_headers: requestHeaders
+              }
+            };
+            await supabase
+              .from('webhook_requests')
+              .update({
+                response_body: enrichedResult,
+                processing_time_ms: Date.now() - startTime
+              })
+              .eq('id', webhookRequestId);
+          }
+        } catch (workflowError) {
+          console.error('Workflow execution error:', workflowError);
+          workflowResult = { 
+            message: 'Workflow execution failed', 
+            error: workflowError.message,
+            data: requestBody 
+          };
+        }
+      } else {
+        console.log(`No matching trigger node found for webhook ${webhook.id} in any of the ${workflows.length} workflows`);
+        // Log all trigger configurations for debugging
+        workflows.forEach((wf, idx) => {
+          if (wf.workflow_data?.nodes) {
+            const triggers = wf.workflow_data.nodes.filter(n => n.type === 'trigger');
+            console.log(`Workflow ${idx} (${wf.name}) triggers:`, triggers.map(t => ({ 
+              selectedHook: t.data?.config?.selectedHook, 
+              triggerType: t.data?.config?.triggerType 
+            })));
+          }
+        });
+      }
+    } else {
+      console.log('No active workflows found for this webhook or error occurred:', workflowError);
+    }
+
+    // Skip duplicate webhook request logging since it was already done during workflow execution
+
+    const finalProcessingTime = Date.now() - startTime;
+    console.log(`Webhook processed successfully in ${finalProcessingTime}ms`);
+
+    // Return custom response if workflow has webhook response node
+    if (workflowResult?.hasWebhookResponse && workflowResult.webhookResponse) {
+      const webhookResponse = workflowResult.webhookResponse;
+      
+      // Handle error responses in webhook response
+      if (webhookResponse.error) {
+        console.log(`❌ Webhook response error: ${webhookResponse.error}`);
+        return new Response(
+          JSON.stringify({ error: webhookResponse.error }),
+          { 
+            status: webhookResponse.statusCode || 500, 
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+          }
+        );
+      }
+      
+      const responseHeaders = {
+        ...corsHeaders,
+        'Content-Type': 'application/json',
+        ...webhookResponse.headers
+      };
+
+      // Build a guaranteed valid JSON response
+      let responseBody: string;
+      const orig = webhookResponse.body;
+      if (typeof orig === 'string') {
+        const trimmed = orig.trim();
+        const looksJson = (trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'));
+        if (looksJson) {
+          try {
+            const parsed = JSON.parse(trimmed);
+            responseBody = JSON.stringify(parsed);
+          } catch (e) {
+            console.log('Invalid JSON string in webhook response; wrapping as JSON object');
+            responseBody = JSON.stringify({ result: orig });
+          }
+        } else {
+          responseBody = JSON.stringify({ result: orig });
+        }
+      } else {
+        responseBody = JSON.stringify(orig);
+      }
+
+      return new Response(
+        responseBody,
+        { 
+          status: webhookResponse.statusCode || 200, 
+          headers: responseHeaders
+        }
+      );
+    }
+
+    // Default response - return the actual workflow result
+    // If we have workflow execution data, return it, otherwise return the original request data
+    const responseData = workflowResult?.data ? workflowResult : { message: 'Webhook received successfully', data: requestBody };
+    
+    return new Response(
+      JSON.stringify(responseData),
+      { 
+        status: 200, 
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
+      }
+    );
+
+  } catch (error) {
+    console.error('Error processing webhook:', error);
+    
+    const processingTime = Date.now() - startTime;
+    
+    return new Response(
+      JSON.stringify({ 
+        error: 'Internal server error',
+        message: error.message 
+      }),
+      { 
+        status: 500, 
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
+      }
+    );
+  }
+});
+
+// Global parameter replacement function
+function replaceParameters(template: any, workflowData: any): any {
+  if (!template) return template;
+  
+  // If it's not a string, recursively process objects/arrays
+  if (typeof template === 'object' && template !== null) {
+    if (Array.isArray(template)) {
+      return template.map(item => replaceParameters(item, workflowData));
+    } else {
+      const result: any = {};
+      for (const [key, value] of Object.entries(template)) {
+        result[key] = replaceParameters(value, workflowData);
+      }
+      return result;
+    }
+  }
+  
+  // Only process strings
+  if (typeof template !== 'string') {
+    return template;
+  }
+  
+  // Replace parameters in the string
+  const replaced = template.replace(/\{\{([^}]+)\}\}/g, (match, expr, offset, full) => {
+    console.log(`🔍 Replacing parameter: ${match}`);
+    console.log(`🔍 Available keys: ${Object.keys(workflowData).join(', ')}`);
+
+    // Detect if the placeholder is wrapped in JSON quotes in the template
+    const prevChar = typeof offset === 'number' && offset > 0 ? (full as string)[offset - 1] : '';
+    const nextChar = typeof offset === 'number' ? (full as string)[offset + match.length] : '';
+    const inJsonQuotes = prevChar === '"' && nextChar === '"';
+
+    // Serialize a value safely for JSON templates
+    const serializeForContext = (val: any) => {
+      // When placeholder is inside quotes → escape the content but don't add extra quotes
+      if (inJsonQuotes) {
+        if (val === null || val === undefined) return '';
+        const asString = typeof val === 'string' ? val : String(val);
+        // JSON.stringify gives us proper escapes; strip surrounding quotes
+        return JSON.stringify(asString).slice(1, -1);
+      }
+      // Outside quotes → emit valid JSON
+      if (typeof val === 'string') return JSON.stringify(val);
+      if (typeof val === 'object') return JSON.stringify(val);
+      if (val === null || val === undefined) return 'null';
+      return String(val);
+    };
+
+    try {
+      const trimmedExpr = (expr as string).trim();
+
+      // First, try direct key access for exact matches (including spaces)
+      if (Object.prototype.hasOwnProperty.call(workflowData, trimmedExpr)) {
+        const value = workflowData[trimmedExpr];
+        const out = serializeForContext(value);
+        console.log(`✅ Direct match - Replaced ${match} with: ${out.substring(0, 100)}`);
+        return out;
+      }
+      
+      // Handle field access within trigger data (e.g., "Trigger 3.image_size1") 
+      const triggerMatch = trimmedExpr.match(/^Trigger\s+\d+\.(.+)$/);
+      if (triggerMatch) {
+        const fieldName = triggerMatch[1];
+        console.log(`🔍 Matched key: "Trigger ${triggerMatch[0].match(/\d+/)?.[0]}", remaining path: "${fieldName}"`);
+        
+        // First, check if the field exists directly in the root of workflowData (webhook request body)
+        if (Object.prototype.hasOwnProperty.call(workflowData, fieldName)) {
+          const value = workflowData[fieldName];
+          const out = serializeForContext(value);
+          console.log(`✅ Found field "${fieldName}" directly in webhook data - Replaced ${match} with: ${out.substring(0, 100)}`);
+          return out;
+        }
+        
+        // Also check in the original request body
+        if (workflowData.originalRequest && Object.prototype.hasOwnProperty.call(workflowData.originalRequest, fieldName)) {
+          const value = workflowData.originalRequest[fieldName];
+          const out = serializeForContext(value);
+          console.log(`✅ Found field "${fieldName}" in originalRequest - Replaced ${match} with: ${out.substring(0, 100)}`);
+          return out;
+        }
+        
+        // Try to find the field in any Trigger object
+        const sortedTriggerKeys = Object.keys(workflowData)
+          .filter(key => key.startsWith('Trigger '))
+          .sort((a, b) => {
+            // Prioritize exact numeric matches
+            const aNum = a.match(/\d+/)?.[0];
+            const bNum = b.match(/\d+/)?.[0];
+            if (aNum && bNum) return parseInt(aNum) - parseInt(bNum);
+            return a.localeCompare(b);
+          });
+        
+        console.log(`🔍 Sorted keys for "${trimmedExpr}":`, sortedTriggerKeys);
+        console.log(`🔍 Available keys:`, Object.keys(workflowData).join(', '));
+        
+        for (const key of sortedTriggerKeys) {
+          if (workflowData[key] && typeof workflowData[key] === 'object') {
+            console.log(`🔍 Property access match: "${key}" -> "${fieldName}"`);
+            console.log(`❌ Available in current object:`, Object.keys(workflowData[key] || {}));
+            
+            if (fieldName in workflowData[key]) {
+              const value = workflowData[key][fieldName];
+              const out = serializeForContext(value);
+              console.log(`✅ Found in ${key}.${fieldName} - Replaced ${match} with: ${out.substring(0, 100)}`);
+              return out;
+            }
+          }
+        }
+        
+        // If not found in Trigger objects, check if field exists in original trigger data
+        console.log(`❌ Trigger field not found: ${fieldName} in any Trigger object`);
+        console.log(`❌ Available trigger fields:`, Object.keys(workflowData).filter(k => k.startsWith('Trigger') || k === 'originalTriggerData' || k === 'trigger' || k === 'data' || k === 'webhookRequestBody' || k === 'originalRequest' || k === 'webhookHeaders' || k === 'webhookId' || k === 'webhookName' || k === 'body' || k === 'webhookData'));
+        console.log(`❌ Available fields in root workflowData:`, Object.keys(workflowData));
+        
+        return inJsonQuotes ? '' : '""'; // Return safe value for missing fields
+      }
+
+      // Handle nested property access like "GPT 1.result" or "Trigger 1.body"
+      let value: any = workflowData;
+      let currentPath = trimmedExpr;
+      
+      // Sort keys prioritizing exact numeric matches first, then by length
+      const sortedKeys = Object.keys(workflowData).sort((a, b) => {
+        // For expressions like "GPT 2.result", prioritize "GPT 2" over "GPT"
+        const aHasNumber = /\d/.test(a);
+        const bHasNumber = /\d/.test(b);
+        
+        // If one has a number and the other doesn't, prioritize the one with a number
+        if (aHasNumber && !bHasNumber) return -1;
+        if (!aHasNumber && bHasNumber) return 1;
+        
+        // Both have numbers or both don't, sort by length (longest first)
+        return b.length - a.length;
+      });
+      
+      console.log(`🔍 Sorted keys for "${trimmedExpr}":`, sortedKeys.slice(0, 10));
+      
+      // Try to find the best matching key
+      let matchedKey: string | null = null;
+      for (const key of sortedKeys) {
+        if (currentPath === key) {
+          // Exact match
+          value = workflowData[key];
+          currentPath = '';
+          matchedKey = key;
+          console.log(`🔍 Exact match found: "${key}"`);
+          break;
+        } else if (currentPath.startsWith(key + '.')) {
+          // Key with property access - ensure exact boundary match
+          const afterKey = currentPath.substring(key.length);
+          if (afterKey.startsWith('.')) {
+            value = workflowData[key];
+            currentPath = afterKey.substring(1); // Remove the dot
+            matchedKey = key;
+            console.log(`🔍 Property access match: "${key}" -> "${currentPath}"`);
+            break;
+          }
+        }
+      }
+      
+      console.log(`🔍 Matched key: "${matchedKey}", remaining path: "${currentPath}"`);
+      
+      // If no exact match found, try fuzzy matching for GPT nodes
+      if (!matchedKey && trimmedExpr.includes('.')) {
+        const [nodePrefix, property] = trimmedExpr.split('.', 2);
+        
+        // For GPT references like "GPT 1.result", "GPT 4.result", etc.
+        if (nodePrefix.toLowerCase().includes('gpt')) {
+          console.log(`🔍 Looking for GPT node matching "${nodePrefix}" with property "${property}"`);
+
+          const requestedNumMatch = nodePrefix.match(/(\d+)$/);
+          const requestedNum = requestedNumMatch ? Number(requestedNumMatch[1]) : null;
+          const wordBoundaryNum = (key: string, num: number) => new RegExp(`\\b${num}\\b`).test(key);
+
+          // All GPT-related keys that expose the requested property
+          const gptKeys = sortedKeys.filter((key) => {
+            const keyLower = key.toLowerCase();
+            const isGptKey = keyLower.includes('gpt');
+            if (!isGptKey) return false;
+            const hasProp = workflowData[key] && typeof workflowData[key] === 'object' && (property in workflowData[key]);
+            return hasProp;
+          });
+
+          console.log(`🔍 Found GPT keys with property "${property}": [${gptKeys.join(', ')}]`);
+
+          if (gptKeys.length > 0) {
+            let candidate: string | undefined;
+            if (requestedNum !== null) {
+              console.log(`🔍 Looking for specific GPT number: ${requestedNum}`);
+              console.log(`🔍 Available GPT keys: ${gptKeys.join(', ')}`);
+              
+              // EXACT matching first - prefer specific numbered keys over generic ones
+              // Try exact "GPT <n>" first
+              candidate = gptKeys.find((k) => {
+                const keyLower = k.toLowerCase();
+                return keyLower === `gpt ${requestedNum}` || keyLower === `gpt${requestedNum}`;
+              });
+              console.log(`🔍 Exact "gpt ${requestedNum}" match:`, candidate);
+              
+              // Then try "GPT Task <n>"  
+              if (!candidate) {
+                candidate = gptKeys.find((k) => {
+                  const keyLower = k.toLowerCase();
+                  return keyLower === `gpt task ${requestedNum}` || keyLower === `gpttask${requestedNum}`;
+                });
+                console.log(`🔍 Exact "gpt task ${requestedNum}" match:`, candidate);
+              }
+              
+              // Then try node-specific keys that contain the exact number with word boundaries
+              if (!candidate) {
+                candidate = gptKeys.find((k) => {
+                  // Use word boundary regex to ensure exact number match
+                  const regex = new RegExp(`\\b${requestedNum}\\b`);
+                  return regex.test(k);
+                });
+                console.log(`🔍 Word boundary match for ${requestedNum}:`, candidate);
+              }
+              
+              // Finally, try to map by numeric suffix in the key (only if no exact match found)
+              if (!candidate) {
+                // Sort gptKeys by how well they match the requested number
+                const withNums = gptKeys
+                  .map((k) => {
+                    const nums = k.match(/\d+/g);
+                    if (!nums) return { k, num: null, score: -1 };
+                    
+                    // If multiple numbers, prefer the one that matches exactly
+                    for (const numStr of nums) {
+                      const num = parseInt(numStr);
+                      if (num === requestedNum) {
+                        return { k, num, score: 10 }; // Highest priority for exact match
+                      }
+                    }
+                    
+                    // If no exact match, use the first number with lower priority
+                    return { k, num: parseInt(nums[0]), score: 1 };
+                  })
+                  .filter((x) => x.num !== null)
+                  .sort((a, b) => b.score - a.score); // Sort by score descending
+                
+                candidate = withNums.find((x) => x.num === requestedNum)?.k;
+                console.log(`🔍 Numeric suffix match for ${requestedNum}:`, candidate, 'from options:', withNums);
+              }
+            }
+
+            // Only use fallback if no specific match was found AND requestedNum is null
+            if (!candidate && requestedNum === null) {
+              candidate = gptKeys[0];
+              console.log(`🔍 Fallback match (no number specified):`, candidate);
+            }
+            
+            if (candidate) {
+              matchedKey = candidate;
+              value = workflowData[matchedKey];
+              currentPath = property;
+              console.log(`🔍 Final matched GPT key: "${matchedKey}" for "${nodePrefix}" with value:`, typeof value === 'object' ? JSON.stringify(value).substring(0, 100) : value);
+            } else {
+              console.log(`❌ No suitable GPT key found for "${nodePrefix}"`);
+            }
+          }
+        }
+      }
+      
+      // If we have a remaining path, traverse it
+      if (currentPath && currentPath.length > 0) {
+        const parts = currentPath.split('.');
+        for (const part of parts) {
+          if (value && typeof value === 'object' && part in value) {
+            value = value[part];
+            console.log(`🔍 Found nested property "${part}":`, typeof value === 'string' ? (value as string).substring(0, 100) : value);
+          } else {
+            console.log(`❌ Path not found: ${trimmedExpr} (missing: ${part})`);
+            console.log(`❌ Available in current object:`, typeof value === 'object' ? Object.keys(value || {}) : 'not an object');
+            return inJsonQuotes ? '' : '""'; // Return safe value for missing fields
+          }
+        }
+      }
+      
+      // Special handling for HTTP response objects when accessing "response" property
+      if (trimmedExpr.endsWith('.response') && value && typeof value === 'object') {
+        console.log(`🔍 Processing HTTP response object for: ${trimmedExpr}`);
+        
+        // Try to extract the actual response content, not the wrapper object
+        if ('http_response' in value && value.http_response && typeof value.http_response === 'object') {
+          if ('body' in value.http_response) {
+            value = value.http_response.body;
+            console.log(`🔍 Extracted HTTP response body:`, value);
+          } else {
+            value = value.http_response;
+            console.log(`🔍 Using HTTP response object:`, value);
+          }
+        } else if ('body' in value && typeof value.body !== 'undefined') {
+          value = value.body;
+          console.log(`🔍 Extracted body from response:`, value);
+        } else if ('response' in value && value.response && typeof value.response === 'object') {
+          if ('body' in value.response) {
+            value = value.response.body;
+            console.log(`🔍 Extracted nested response body:`, value);
+          } else {
+            value = value.response;
+            console.log(`🔍 Using nested response:`, value);
+          }
+        }
+        // If it's an error response with EntityID, keep the error message for debugging
+        else if ('EntityID' in value && 'Message' in value) {
+          console.log(`🔍 Found error response object:`, value);
+          // For error responses, return the error message instead of [object Object]
+          value = value.Message || 'HTTP request failed';
+        }
+      }
+      
+      const out = serializeForContext(value);
+      console.log(`✅ Replaced ${match} with: ${out.substring(0, 100)}${out.length > 100 ? '...' : ''}`);
+      return out;
+    } catch (error) {
+      console.log(`❌ Error replacing ${match}:`, error);
+      // Return empty string for missing fields to avoid JSON syntax errors
+      return inJsonQuotes ? '' : '""';
+    }
+  });
+  
+  return replaced;
+}
+
+// New function that waits for all parallel HTTP tasks before webhook response
+async function processWorkflowWithEarlyResponse(workflowData: any, inputData: any, supabase: any, webhookRequestId?: string, workflowId?: string, userId?: string): Promise<any> {
+  const { nodes, edges } = workflowData;
+  
+  // Check if workflow has webhook response node
+  const webhookResponseNode = nodes.find((node: WorkflowNode) => node.type === 'webhookResponse');
+  const hasWebhookResponseNode = !!webhookResponseNode;
+  
+  if (!hasWebhookResponseNode) {
+    // No webhook response node, use regular processing
+    return await processWorkflow(workflowData, inputData, supabase, webhookRequestId, workflowId, userId);
+  }
+
+  // Analyze workflow structure to find parallel HTTP and GPT tasks
+  const parallelHttpGroups = findParallelHttpGroups(nodes, edges, webhookResponseNode.id);
+  const parallelGptGroups = findParallelGptGroups(nodes, edges, webhookResponseNode.id);
+  console.log('🔍 Found parallel HTTP groups:', parallelHttpGroups);
+  console.log('🔍 Found parallel GPT groups:', parallelGptGroups);
+
+  // If no parallel tasks at all, use regular processing
+  if (parallelHttpGroups.length === 0 && parallelGptGroups.length === 0) {
+    return await processWorkflow(workflowData, inputData, supabase, webhookRequestId, workflowId, userId);
+  }
+
+  // Process workflow with parallel HTTP optimization
+  let webhookResponseResult = null;
+  let executionId = null;
+  let accumulatedWorkflowData: any = {
+    originalTriggerData: inputData,
+    trigger: inputData,
+    data: inputData,
+    webhookRequestBody: inputData,
+    ...inputData
+  };
+
+  // Add trigger data with multiple numbering options for compatibility
+  for (let i = 1; i <= 10; i++) {
+    accumulatedWorkflowData[`Trigger ${i}`] = {
+      body: inputData,
+      ...inputData
+    };
+  }
+
+  try {
+    // Create workflow execution record
+    if (workflowId && userId && webhookRequestId) {
+      const { data: execution, error: execError } = await supabase
+        .from('workflow_executions')
+        .insert({
+          workflow_id: workflowId,
+          webhook_request_id: webhookRequestId,
+          user_id: userId,
+          status: 'running',
+          executed_nodes: [],
+          current_node_id: null
+        })
+        .select()
+        .single();
+
+      if (execution && !execError) {
+        executionId = execution.id;
+        console.log('🚀 Created workflow execution record:', executionId);
+      }
+    }
+
+    const executedNodes = new Set<string>();
+    const nodeTypeCounts = new Map<string, number>();
+    
+    // Find trigger node and execute it first
+    const triggerNode = nodes.find((node: WorkflowNode) => node.type === 'trigger');
+    if (!triggerNode) {
+      throw new Error('No trigger node found');
+    }
+
+    // Execute trigger node
+    console.log('⚡ Executing trigger node');
+    executedNodes.add(triggerNode.id);
+    const triggerResult = await executeNode(triggerNode, accumulatedWorkflowData, supabase);
+    if (triggerResult) {
+      accumulatedWorkflowData = { ...accumulatedWorkflowData, ...triggerResult };
+    }
+
+    // Execute all parallel task groups (HTTP and GPT)
+    const allParallelTasks: Promise<any>[] = [];
+    
+    // Add HTTP tasks
+    for (const httpGroup of parallelHttpGroups) {
+      console.log(`🚀 Adding ${httpGroup.length} parallel HTTP tasks:`, httpGroup);
+      
+      for (const nodeId of httpGroup) {
+        const task = executeParallelTask(nodeId, nodes, accumulatedWorkflowData, executedNodes, executionId, supabase, 'httpTask');
+        allParallelTasks.push(task);
+      }
+    }
+    
+    // Add GPT tasks  
+    for (const gptGroup of parallelGptGroups) {
+      console.log(`🚀 Adding ${gptGroup.length} parallel GPT tasks:`, gptGroup);
+      
+      for (const nodeId of gptGroup) {
+        const task = executeParallelTask(nodeId, nodes, accumulatedWorkflowData, executedNodes, executionId, supabase, 'gptTask');
+        allParallelTasks.push(task);
+      }
+    }
+
+    // Wait for ALL parallel tasks (HTTP + GPT) to complete
+    console.log(`🚀 Waiting for ${allParallelTasks.length} parallel tasks to complete...`);
+    const allResults = await Promise.all(allParallelTasks);
+    
+    // Process all results
+    for (const taskResult of allResults) {
+      if (!taskResult) continue;
+
+      const { nodeId, node, result, failed, taskType } = taskResult;
+      
+      if (failed) {
+        console.error(`❌ ${taskType} task ${nodeId} failed, stopping workflow`);
+        
+        if (executionId) {
+          await supabase
+            .from('workflow_executions')
+            .update({
+              status: 'failed',
+              error_details: {
+                failed_node_id: nodeId,
+                error_message: result?.error || `${taskType} task failed`
+              }
+            })
+            .eq('id', executionId);
+        }
+        
+        throw new Error(`${taskType} task ${nodeId} failed: ${result?.error}`);
+      }
+
+      // Store result with proper indexing
+      if (result && typeof result === 'object') {
+        const safeNodeResult = JSON.parse(JSON.stringify(result));
+        const nodeLabel = node.data?.label || node.data?.config?.label || '';
+        
+        if (taskType === 'httpTask') {
+          // Get or increment the count for HTTP tasks
+          const currentCount = nodeTypeCounts.get('httpTask') || 0;
+          const nodeIndex = currentCount + 1;
+          nodeTypeCounts.set('httpTask', nodeIndex);
+          
+          // Store with multiple reference patterns
+          accumulatedWorkflowData[nodeId] = safeNodeResult;
+          accumulatedWorkflowData[`HTTP ${nodeIndex}`] = safeNodeResult;
+          accumulatedWorkflowData[`HTTP Task ${nodeIndex}`] = safeNodeResult;
+          
+          // Store under label if exists
+          if (nodeLabel.trim()) {
+            accumulatedWorkflowData[nodeLabel.trim()] = safeNodeResult;
+          }
+          
+          // Store first HTTP as default
+          if (!accumulatedWorkflowData['HTTP']) {
+            accumulatedWorkflowData['HTTP'] = safeNodeResult;
+          }
+          
+          console.log(`💾 Stored HTTP result as "HTTP ${nodeIndex}"`);
+        } else if (taskType === 'gptTask') {
+          // Get or increment the count for GPT tasks
+          const currentCount = nodeTypeCounts.get('gptTask') || 0;
+          const nodeIndex = currentCount + 1;
+          nodeTypeCounts.set('gptTask', nodeIndex);
+          
+          // Store with multiple reference patterns
+          accumulatedWorkflowData[nodeId] = safeNodeResult;
+          accumulatedWorkflowData[`GPT ${nodeIndex}`] = safeNodeResult;
+          accumulatedWorkflowData[`GPT Task ${nodeIndex}`] = safeNodeResult;
+          
+          // Store under label if exists
+          if (nodeLabel.trim()) {
+            accumulatedWorkflowData[nodeLabel.trim()] = safeNodeResult;
+          }
+          
+          // Store first GPT as default
+          if (!accumulatedWorkflowData['GPT']) {
+            accumulatedWorkflowData['GPT'] = safeNodeResult;
+          }
+          
+          console.log(`💾 Stored GPT result as "GPT ${nodeIndex}" with result:`, 
+            typeof result.result === 'string' 
+              ? result.result.substring(0, 100) + '...'
+              : result.result
+          );
+        }
+      }
+    }
+
+    console.log(`✅ Completed ALL parallel tasks. HTTP: ${nodeTypeCounts.get('httpTask') || 0}, GPT: ${nodeTypeCounts.get('gptTask') || 0}`);
+    console.log('🎯 All accumulated data keys before webhook response:', Object.keys(accumulatedWorkflowData));
+
+    // Now execute the webhook response node with ALL results (HTTP + GPT)
+    console.log('🎯 Executing webhook response node with ALL parallel results');
+    console.log('🎯 Available data keys:', Object.keys(accumulatedWorkflowData));
+    console.log('🎯 HTTP result keys:', Object.keys(accumulatedWorkflowData).filter(k => k.startsWith('HTTP')));
+    console.log('🎯 GPT result keys:', Object.keys(accumulatedWorkflowData).filter(k => k.startsWith('GPT')));
+
+    // Update execution tracking for webhook response
+    if (executionId) {
+      await supabase
+        .from('workflow_executions')
+        .update({
+          current_node_id: webhookResponseNode.id,
+          executed_nodes: Array.from(executedNodes)
+        })
+        .eq('id', executionId);
+    }
+
+    executedNodes.add(webhookResponseNode.id);
+
+    // Resolve and execute webhook response node
+    const resolvedWebhookNode = {
+      ...webhookResponseNode,
+      data: {
+        ...webhookResponseNode.data,
+        config: replaceParameters(webhookResponseNode.data?.config, accumulatedWorkflowData)
+      }
+    };
+
+    const webhookResult = await executeNode(resolvedWebhookNode, accumulatedWorkflowData, supabase);
+    
+    if (webhookResult?.webhook_response) {
+      webhookResponseResult = webhookResult.webhook_response;
+      console.log('🎯 WEBHOOK RESPONSE with all HTTP results:', webhookResponseResult);
+    }
+
+    // Mark execution as completed
+    if (executionId) {
+      await supabase
+        .from('workflow_executions')
+        .update({
+          status: 'completed',
+          completed_at: new Date().toISOString(),
+          executed_nodes: Array.from(executedNodes),
+          result_data: {
+            optimizedParallelExecution: true,
+            httpTaskCount: nodeTypeCounts.get('httpTask') || 0,
+            gptTaskCount: nodeTypeCounts.get('gptTask') || 0,
+            totalParallelTasks: (nodeTypeCounts.get('httpTask') || 0) + (nodeTypeCounts.get('gptTask') || 0),
+            completedAt: new Date().toISOString(),
+            nodeResults: { [webhookResponseNode.id]: webhookResult },
+            workflowData: accumulatedWorkflowData
+          }
+        })
+        .eq('id', executionId);
+    }
+
+    return {
+      message: 'Workflow completed with parallel HTTP and GPT optimization',
+      status: 'completed',
+      executedNodes: Array.from(executedNodes),
+      nodeCount: executedNodes.size,
+      httpTaskCount: nodeTypeCounts.get('httpTask') || 0,
+      gptTaskCount: nodeTypeCounts.get('gptTask') || 0,
+      totalParallelTasks: (nodeTypeCounts.get('httpTask') || 0) + (nodeTypeCounts.get('gptTask') || 0),
+      executionId: executionId || null,
+      hasWebhookResponse: true,
+      webhookResponse: webhookResponseResult,
+      parallelOptimized: true
+    };
+
+  } catch (error) {
+    console.error('❌ Parallel HTTP workflow failed:', error);
+    
+    if (executionId) {
+      await supabase
+        .from('workflow_executions')
+        .update({
+          status: 'failed',
+          error_message: error.message
+        })
+        .eq('id', executionId);
+    }
+    
+    throw error;
+  }
+}
+
+// Helper function to find parallel GPT task groups
+function findParallelGptGroups(nodes: WorkflowNode[], edges: any[], webhookResponseNodeId: string): string[][] {
+  const gptNodes = nodes.filter(node => node.type === 'gptTask');
+  
+  // Filter GPT nodes that have a path to webhook response
+  const relevantGptNodes = gptNodes.filter(gptNode => {
+    // Check if there's a path from this GPT node to webhook response
+    return hasPathToTarget(edges, gptNode.id, webhookResponseNodeId);
+  });
+
+  // For now, treat all relevant GPT nodes as one parallel group
+  // In future, we could analyze dependencies between GPT nodes
+  if (relevantGptNodes.length > 0) {
+    return [relevantGptNodes.map(node => node.id)];
+  }
+  
+  return [];
+}
+
+// Helper function to execute a parallel task (HTTP or GPT)
+async function executeParallelTask(
+  nodeId: string, 
+  nodes: WorkflowNode[], 
+  accumulatedWorkflowData: any, 
+  executedNodes: Set<string>, 
+  executionId: string | null, 
+  supabase: any,
+  taskType: 'httpTask' | 'gptTask'
+) {
+  const node = nodes.find((n: WorkflowNode) => n.id === nodeId);
+  if (!node) return null;
+
+  console.log(`⚡ Starting parallel ${taskType} ${nodeId}`);
+  
+  // Update execution tracking
+  if (executionId) {
+    await supabase
+      .from('workflow_executions')
+      .update({
+        current_node_id: nodeId,
+        executed_nodes: Array.from(executedNodes)
+      })
+      .eq('id', executionId);
+  }
+
+  executedNodes.add(nodeId);
+
+  try {
+    // Resolve node configuration with parameter replacement
+    const resolvedNode = {
+      ...node,
+      data: {
+        ...node.data,
+        config: replaceParameters(node.data?.config, accumulatedWorkflowData)
+      }
+    };
+
+    // Execute task
+    const nodeResult = await executeNode(resolvedNode, accumulatedWorkflowData, supabase);
+    
+    console.log(`✅ Parallel ${taskType} ${nodeId} completed`);
+    return {
+      nodeId,
+      node,
+      result: nodeResult,
+      taskType
+    };
+  } catch (error) {
+    console.error(`❌ Parallel ${taskType} ${nodeId} failed:`, error);
+    return {
+      nodeId,
+      node,
+      result: { error: error.message },
+      failed: true,
+      taskType
+    };
+  }
+}
+
+// Helper function to find parallel HTTP task groups  
+function findParallelHttpGroups(nodes: WorkflowNode[], edges: any[], webhookResponseNodeId: string): string[][] {
+  const httpNodes = nodes.filter(node => node.type === 'httpTask');
+  if (httpNodes.length === 0) return [];
+  
+  // Find HTTP nodes that connect to the webhook response node
+  const httpToWebhookNodes = httpNodes.filter(httpNode => {
+    // Check if there's a path from this HTTP node to webhook response
+    return hasPathToTarget(edges, httpNode.id, webhookResponseNodeId);
+  });
+  
+  if (httpToWebhookNodes.length <= 1) return [];
+  
+  // Group HTTP nodes that can run in parallel (same "level" in the workflow)
+  const parallelGroups: string[][] = [];
+  const processedNodes = new Set<string>();
+  
+  for (const httpNode of httpToWebhookNodes) {
+    if (processedNodes.has(httpNode.id)) continue;
+    
+    // Find all HTTP nodes at the same level (parallel group)
+    const parallelGroup = [httpNode.id];
+    processedNodes.add(httpNode.id);
+    
+    // Find other HTTP nodes that are at the same "depth" from trigger
+    const httpDepth = getNodeDepthFromTrigger(nodes, edges, httpNode.id);
+    
+    for (const otherHttpNode of httpToWebhookNodes) {
+      if (processedNodes.has(otherHttpNode.id)) continue;
+      
+      const otherDepth = getNodeDepthFromTrigger(nodes, edges, otherHttpNode.id);
+      if (otherDepth === httpDepth) {
+        parallelGroup.push(otherHttpNode.id);
+        processedNodes.add(otherHttpNode.id);
+      }
+    }
+    
+    if (parallelGroup.length > 1) {
+      parallelGroups.push(parallelGroup);
+    } else if (parallelGroup.length === 1) {
+      // Single HTTP node, still add as a group
+      parallelGroups.push(parallelGroup);
+    }
+  }
+  
+  return parallelGroups;
+}
+
+// Helper function to check if there's a path from source to target
+function hasPathToTarget(edges: any[], sourceId: string, targetId: string): boolean {
+  const visited = new Set<string>();
+  
+  function dfs(currentId: string): boolean {
+    if (currentId === targetId) return true;
+    if (visited.has(currentId)) return false;
+    
+    visited.add(currentId);
+    
+    const outgoingEdges = edges.filter(edge => edge.source === currentId);
+    for (const edge of outgoingEdges) {
+      if (dfs(edge.target)) return true;
+    }
+    
+    return false;
+  }
+  
+  return dfs(sourceId);
+}
+
+// Helper function to get node depth from trigger
+function getNodeDepthFromTrigger(nodes: WorkflowNode[], edges: any[], nodeId: string): number {
+  const triggerNode = nodes.find(node => node.type === 'trigger');
+  if (!triggerNode) return 0;
+  
+  const visited = new Set<string>();
+  
+  function findDepth(currentId: string, depth: number): number {
+    if (currentId === nodeId) return depth;
+    if (visited.has(currentId)) return -1;
+    
+    visited.add(currentId);
+    
+    const outgoingEdges = edges.filter(edge => edge.source === currentId);
+    for (const edge of outgoingEdges) {
+      const result = findDepth(edge.target, depth + 1);
+      if (result !== -1) return result;
+    }
+    
+    return -1;
+  }
+  
+  return findDepth(triggerNode.id, 0);
+}
+
+// Helper function to build execution order from trigger to webhook response node
+async function buildExecutionOrderToWebhookResponse(nodes: WorkflowNode[], edges: any[], startNodeId: string, targetNodeId: string): Promise<string[]> {
+  const visited = new Set<string>();
+  const executionOrder: string[] = [];
+  
+  function findPath(currentNodeId: string): boolean {
+    if (visited.has(currentNodeId)) return false;
+    
+    visited.add(currentNodeId);
+    executionOrder.push(currentNodeId);
+    
+    if (currentNodeId === targetNodeId) {
+      return true; // Found target
+    }
+    
+    // Find outgoing edges from current node
+    const outgoingEdges = edges.filter((edge: any) => edge.source === currentNodeId);
+    
+    for (const edge of outgoingEdges) {
+      if (findPath(edge.target)) {
+        return true; // Path found through this edge
+      }
+    }
+    
+    // Backtrack if no path found
+    executionOrder.pop();
+    return false;
+  }
+  
+  findPath(startNodeId);
+  return executionOrder;
+}
+
+// Background processing function
+async function continueWorkflowInBackground(
+  remainingNodes: WorkflowNode[], 
+  edges: any[], 
+  accumulatedWorkflowData: any, 
+  executedNodes: Set<string>, 
+  supabase: any, 
+  executionId: string | null,
+  nodeTypeCounts: Map<string, number>
+): Promise<void> {
+  console.log('🔄 Background processing started for remaining nodes');
+  
+  try {
+    // Continue with remaining workflow processing
+    // This is a simplified version - you could implement the full parallel execution logic here
+    for (const node of remainingNodes) {
+      if (executedNodes.has(node.id)) continue;
+      
+      console.log(`🔄 Background executing ${node.type} (${node.id})`);
+      
+      try {
+        const resolvedNode = {
+          ...node,
+          data: {
+            ...node.data,
+            config: replaceParameters(node.data?.config, accumulatedWorkflowData)
+          }
+        };
+        
+        const nodeResult = await executeNode(resolvedNode, accumulatedWorkflowData, supabase);
+        executedNodes.add(node.id);
+        
+        // Store result
+        if (nodeResult && typeof nodeResult === 'object') {
+          const safeNodeResult = JSON.parse(JSON.stringify(nodeResult));
+          accumulatedWorkflowData[node.id] = safeNodeResult;
+        }
+        
+        console.log(`✅ Background completed ${node.type} (${node.id})`);
+        
+      } catch (error) {
+        console.error(`❌ Background node ${node.id} failed:`, error);
+        // Continue with other nodes even if one fails
+      }
+    }
+    
+    // Mark execution as completed
+    if (executionId) {
+      await supabase
+        .from('workflow_executions')
+        .update({
+          status: 'completed',
+          completed_at: new Date().toISOString(),
+          executed_nodes: Array.from(executedNodes)
+        })
+        .eq('id', executionId);
+    }
+    
+    console.log('✅ Background processing completed');
+    
+  } catch (error) {
+    console.error('❌ Background processing failed:', error);
+    
+    if (executionId) {
+      await supabase
+        .from('workflow_executions')
+        .update({
+          status: 'failed',
+          error_message: `Background processing failed: ${error.message}`
+        })
+        .eq('id', executionId);
+    }
+  }
+}
+
+// Original processWorkflow function (kept for workflows without webhook response nodes)
+async function processWorkflow(workflowData: any, inputData: any, supabase: any, webhookRequestId?: string, workflowId?: string, userId?: string): Promise<any> {
+  const { nodes, edges } = workflowData;
+  
+  // Precompute GPT node numbering maps (prefer stored nodeNumber, fallback to creation order by id)
+  const gptNodesAll = Array.isArray(nodes)
+    ? (nodes as WorkflowNode[]).filter((n) => n.type === 'gptTask')
+    : [];
+  const extractNumeric = (id: string) => {
+    const m = id?.match(/(\d{6,}|\d+)$/);
+    return m ? Number(m[1]) : 0;
+  };
+  const gptCreationSorted = [...gptNodesAll].sort(
+    (a, b) => extractNumeric(a.id) - extractNumeric(b.id)
+  );
+  const gptIdToCreationIndex = new Map<string, number>();
+  gptCreationSorted.forEach((n, i) => gptIdToCreationIndex.set(n.id, i + 1));
+  const gptIdToPreferredNumber = new Map<string, number>();
+  gptNodesAll.forEach((n) => {
+    const num = typeof n.data?.nodeNumber === 'number'
+      ? n.data.nodeNumber
+      : gptIdToCreationIndex.get(n.id) || 1;
+    gptIdToPreferredNumber.set(n.id, num);
+  });
+  
+  // Check if workflow has webhook response node
+  const hasWebhookResponseNode = nodes.some((node: WorkflowNode) => node.type === 'webhookResponse');
+  
+  // Initialize workflow data that accumulates results from each node
+  let accumulatedWorkflowData: any = {
+    originalTriggerData: inputData,
+    trigger: inputData,
+    data: inputData,
+    webhookRequestBody: inputData,
+    // CRITICAL: Also add all individual fields from inputData at root level for easy parameter access
+    ...inputData
+  };
+  
+  // Ensure all webhook fields are available for parameter replacement
+  if (inputData && typeof inputData === 'object') {
+    Object.keys(inputData).forEach(key => {
+      if (key.match(/^(prompt|image_size|keyword|seo)\d*$/)) {
+        accumulatedWorkflowData[key] = inputData[key];
+      }
+    });
+  }
+  
+  console.log('🎯 Initial trigger data stored with keys:', Object.keys(accumulatedWorkflowData));
+  console.log('🎯 Available numbered fields for parameter replacement:', Object.keys(accumulatedWorkflowData).filter(k => k.match(/^(prompt|image_size|keyword|seo)\d*$/)));
+  console.log('🎯 originalTriggerData sample:', JSON.stringify(accumulatedWorkflowData.originalTriggerData, null, 2).substring(0, 500));
+  
+  // Add trigger data with multiple numbering options for compatibility
+  console.log('🎯 Creating trigger objects with inputData:', Object.keys(inputData));
+  for (let i = 1; i <= 10; i++) {
+    accumulatedWorkflowData[`Trigger ${i}`] = {
+      body: inputData,
+      ...inputData
+    };
+  }
+  
+  // Log what's actually in Trigger 3 for debugging
+  console.log('🎯 Trigger 3 contains:', Object.keys(accumulatedWorkflowData['Trigger 3'] || {}));
+  console.log('🎯 Trigger 3 data sample:', JSON.stringify(accumulatedWorkflowData['Trigger 3'], null, 2).substring(0, 500));
+  
+  let executionId = null;
+  let webhookResponseResult = null;
+  
+  try {
+    // Create workflow execution record for real-time tracking
+    if (workflowId && userId && webhookRequestId) {
+      const { data: execution, error: execError } = await supabase
+        .from('workflow_executions')
+        .insert({
+          workflow_id: workflowId,
+          webhook_request_id: webhookRequestId,
+          user_id: userId,
+          status: 'running',
+          executed_nodes: [],
+          current_node_id: null
+        })
+        .select()
+        .single();
+
+      if (execution && !execError) {
+        executionId = execution.id;
+        console.log('Created workflow execution record:', executionId);
+      }
+    }
+
+    // Find the trigger node (webhook trigger)
+    const triggerNode = nodes.find((node: WorkflowNode) => node.type === 'trigger');
+    if (!triggerNode) {
+      console.log('No trigger node found, returning input data');
+      return { message: 'No workflow trigger found', data: accumulatedWorkflowData };
+    }
+
+    // Execute nodes with automatic parallel/sequential detection based on connections
+    const executedNodes = new Set<string>();
+    let batchIndex = 1;
+    
+    // Keep track of node counts by type for proper labeling
+    const nodeTypeCounts = new Map<string, number>();
+    
+    // Start with trigger node
+    let currentNodes = [triggerNode.id];
+    
+    while (currentNodes.length > 0) {
+      const nodesToExecute = [];
+      
+      // Collect all nodes to execute in this batch
+      for (const nodeId of currentNodes) {
+        if (!executedNodes.has(nodeId)) {
+          const node = nodes.find((n: WorkflowNode) => n.id === nodeId);
+          if (node) {
+            nodesToExecute.push(node);
+          }
+        }
+      }
+      
+      if (nodesToExecute.length === 0) break;
+      
+      console.log(`\n🚀 Executing ${nodesToExecute.length} nodes in parallel (batch ${batchIndex})`);
+      
+      // Execute all nodes in parallel
+      const parallelResults = await Promise.all(
+        nodesToExecute.map(async (currentNode) => {
+          if (executedNodes.has(currentNode.id)) {
+            return { nodeId: currentNode.id, result: null, skipped: true };
+          }
+          
+          console.log(`  ⚡ Starting ${currentNode.type} (${currentNode.id})`);
+          console.log(`  📊 Available data keys: ${Object.keys(accumulatedWorkflowData).join(', ')}`);
+          
+          // Update execution tracking - node started
+          if (executionId) {
+            await supabase
+              .from('workflow_executions')
+              .update({
+                current_node_id: currentNode.id,
+                executed_nodes: Array.from(executedNodes)
+              })
+              .eq('id', executionId);
+          }
+          
+          executedNodes.add(currentNode.id);
+
+          try {
+            // 1. Clone and resolve node configuration with parameter replacement
+            const resolvedNode = {
+              ...currentNode,
+              data: {
+                ...currentNode.data,
+                config: replaceParameters(currentNode.data?.config, accumulatedWorkflowData)
+              }
+            };
+            
+            console.log(`  📝 Node ${currentNode.id} resolved config:`, JSON.stringify(resolvedNode.data.config, null, 2));
+
+            // 2. Execute the node with resolved configuration
+            const nodeResult = await executeNode(resolvedNode, accumulatedWorkflowData, supabase);
+            
+            console.log(`  ✅ Node ${currentNode.type} (${currentNode.id}) completed`);
+            
+            return {
+              nodeId: currentNode.id,
+              nodeType: currentNode.type,
+              result: nodeResult,
+              node: currentNode
+            };
+          } catch (error) {
+            console.error(`  ❌ Node ${currentNode.type} (${currentNode.id}) failed:`, error);
+            return {
+              nodeId: currentNode.id,
+              nodeType: currentNode.type,
+              result: { error: error.message },
+              node: currentNode,
+              failed: true
+            };
+          }
+        })
+      );
+      
+      // Process results and update accumulated data
+      for (const { nodeId, nodeType, result, node, skipped, failed } of parallelResults) {
+        if (skipped) continue;
+        
+        // 3. Check for failed nodes and stop execution
+        if (failed) {
+          console.error(`❌ Node execution failed, stopping workflow: ${nodeId} (${nodeType})`);
+          
+          // Update execution status to failed with error details
+          if (executionId) {
+            await supabase
+              .from('workflow_executions')
+              .update({
+                status: 'failed',
+                error_details: {
+                  failed_node_id: nodeId,
+                  failed_node_type: nodeType,
+                  error_message: result?.error || 'Unknown error',
+                  executed_nodes: Array.from(executedNodes)
+                },
+                updated_at: new Date().toISOString()
+              })
+              .eq('id', executionId);
+          }
+          
+          // Send real-time update about the failed node
+          const channel = supabase.channel(`workflow-execution-${executionId}`);
+          await channel.send({
+            type: 'broadcast',
+            event: 'node_failed',
+            payload: {
+              nodeId,
+              nodeType,
+              error: result?.error || 'Unknown error',
+              executionId
+            }
+          });
+          
+          throw new Error(`Node ${nodeId} (${nodeType}) failed: ${result?.error || 'Unknown error'}`);
+        }
+        
+        // 4. Check if this is a webhook response node
+        if (nodeType === 'webhookResponse') {
+          if (result?.webhook_response) {
+            webhookResponseResult = result.webhook_response;
+            console.log(`🎯 Found webhook response from node ${nodeId}:`, webhookResponseResult);
+          }
+        }
+        
+        // Get or increment the count for this node type (only for successful nodes)
+        const currentCount = nodeTypeCounts.get(nodeType) || 0;
+        const nodeIndex = currentCount + 1;
+        nodeTypeCounts.set(nodeType, nodeIndex);
+        
+        // 5. Save result for other nodes to reference
+        if (result && typeof result === 'object') {
+          // Create a safe copy of result without circular references
+          const safeNodeResult = JSON.parse(JSON.stringify(result));
+          
+          // Get the node label from node data
+          const nodeLabel = node.data?.label || node.data?.config?.label || '';
+          
+          // Store result with multiple reference patterns
+          const nodeRefName = `${nodeType.charAt(0).toUpperCase() + nodeType.slice(1)} ${nodeIndex}`;
+          const shortNodeRef = `${nodeType.charAt(0).toUpperCase() + nodeType.slice(1)}`;
+          
+          accumulatedWorkflowData[nodeId] = safeNodeResult;
+          accumulatedWorkflowData[nodeRefName] = safeNodeResult;
+          accumulatedWorkflowData[shortNodeRef] = safeNodeResult;
+
+          // Special aliases for HTTP to match UI parameters like "HTTP 1.response"
+          if (nodeType === 'httpTask') {
+            accumulatedWorkflowData[`HTTP ${nodeIndex}`] = safeNodeResult;
+            if (!accumulatedWorkflowData['HTTP']) {
+              accumulatedWorkflowData['HTTP'] = safeNodeResult;
+            }
+            // Common label-style alias
+            accumulatedWorkflowData[`HTTP Request ${nodeIndex}`] = safeNodeResult;
+            if (!accumulatedWorkflowData['HTTP Request']) {
+              accumulatedWorkflowData['HTTP Request'] = safeNodeResult;
+            }
+          }
+          
+          // Store under the actual node label if it exists
+          if (nodeLabel.trim()) {
+            accumulatedWorkflowData[nodeLabel.trim()] = safeNodeResult;
+            console.log(`  💾 Stored under label: ${nodeLabel.trim()}`);
+          }
+          
+          // For GPT nodes, store with deterministic keys based on node configuration
+          if (nodeType === 'gptTask') {
+            // Extract number from node label (e.g., "GPT 3" -> 3) as the primary source
+            let nodeNumber = null;
+            
+            // First, try to extract from label - be more flexible with parsing
+            if (nodeLabel.trim()) {
+              const labelMatch = nodeLabel.trim().match(/(\d+)/);
+              if (labelMatch) {
+                nodeNumber = parseInt(labelMatch[1]);
+              }
+            }
+            
+            // If no number from label, use nodeNumber from data
+            if (!nodeNumber && node.data?.nodeNumber) {
+              nodeNumber = node.data.nodeNumber;
+            }
+            
+            // Try to extract from node ID as fallback (in case it contains a number)
+            if (!nodeNumber) {
+              const idMatch = nodeId.match(/(\d+)/);
+              if (idMatch) {
+                nodeNumber = parseInt(idMatch[1]);
+              }
+            }
+            
+            // Last fallback - use a unique identifier based on position in nodes array
+            if (!nodeNumber) {
+              // Find the position of this GPT node in the list of ALL GPT nodes (sorted by creation order)
+              const allGptNodes = nodes
+                .filter((n: WorkflowNode) => n.type === 'gptTask')
+                .sort((a: WorkflowNode, b: WorkflowNode) => {
+                  // Sort by node creation timestamp if available, otherwise by ID
+                  const aTime = a.data?.createdAt || a.id;
+                  const bTime = b.data?.createdAt || b.id;
+                  return aTime.localeCompare(bTime);
+                });
+              
+              const gptIndex = allGptNodes.findIndex((n: WorkflowNode) => n.id === nodeId);
+              nodeNumber = gptIndex >= 0 ? gptIndex + 1 : nodeIndex;
+            }
+            
+            console.log(`🔍 GPT Node Debug:`, {
+              nodeId,
+              nodeLabel: nodeLabel.trim(),
+              extractedFromLabel: nodeLabel.trim().match(/(\d+)/)?.[1],
+              nodeDataNumber: node.data?.nodeNumber,
+              idExtracted: nodeId.match(/(\d+)/)?.[1],
+              fallbackNodeIndex: nodeIndex,
+              finalNodeNumber: nodeNumber,
+              dataKeys: Object.keys(node.data || {})
+            });
+            
+            // Store under the exact node number that appears in the UI
+            accumulatedWorkflowData[`GPT ${nodeNumber}`] = safeNodeResult;
+            accumulatedWorkflowData[`GPT Task ${nodeNumber}`] = safeNodeResult;
+            
+            // Also store under node ID for internal reference
+            accumulatedWorkflowData[nodeId] = safeNodeResult;
+            
+            // Store under the node label if it exists (for UI display purposes)
+            if (nodeLabel.trim()) {
+              accumulatedWorkflowData[nodeLabel.trim()] = safeNodeResult;
+            }
+            
+            // Also store under both potential label formats
+            if (nodeLabel.trim() && nodeLabel.includes('GPT')) {
+              // Extract number from label if possible (e.g., "GPT 3" -> 3)
+              const labelMatch = nodeLabel.match(/GPT\s*(\d+)/i);
+              if (labelMatch) {
+                const labelNumber = parseInt(labelMatch[1]);
+                accumulatedWorkflowData[`GPT ${labelNumber}`] = safeNodeResult;
+                accumulatedWorkflowData[`GPT Task ${labelNumber}`] = safeNodeResult;
+                console.log(`📝 Also stored under label-derived key: GPT ${labelNumber}`);
+              }
+            }
+            
+            // Generic fallback only for the first GPT node
+            if (!accumulatedWorkflowData['GPT']) {
+              accumulatedWorkflowData['GPT'] = safeNodeResult;
+              accumulatedWorkflowData['GPT Task'] = safeNodeResult;
+            }
+            
+            console.log(`🧠 GPT Node ${nodeId} stored as "GPT ${nodeNumber}" with result:`, typeof safeNodeResult.result === 'string' ? safeNodeResult.result.substring(0, 100) : safeNodeResult.result);
+            console.log(`🔑 All GPT storage keys for this node:`, [`GPT ${nodeNumber}`, `GPT Task ${nodeNumber}`, nodeId, nodeLabel.trim()].filter(k => k));
+          }
+          
+          // For Trigger nodes, store with flexible numeric references to handle UI references
+          if (nodeType === 'trigger') {
+            // Always store under Trigger 3 since that's what the UI commonly references
+            // Also store under multiple keys for flexibility
+            const triggerKeys = ['Trigger 1', 'Trigger 2', 'Trigger 3', 'Trigger 4', 'Trigger 5'];
+            
+            for (const key of triggerKeys) {
+              accumulatedWorkflowData[key] = safeNodeResult;
+            }
+            
+            // Also store generic aliases
+            accumulatedWorkflowData['Trigger'] = safeNodeResult;
+            accumulatedWorkflowData['Webhook Trigger'] = safeNodeResult;
+            
+            console.log(`🎯 Trigger Node Debug:`, {
+              nodeId,
+              nodeLabel: nodeLabel.trim(),
+              dataKeys: Object.keys(safeNodeResult || {}),
+              sampleFields: Object.keys(safeNodeResult || {}).filter(k => k.match(/^(prompt|image_size)\d*$/)),
+              storedUnderKeys: triggerKeys
+            });
+            
+            console.log(`🎯 Trigger Node ${nodeId} stored under multiple keys for compatibility`);
+            console.log(`🎯 Available trigger fields:`, Object.keys(safeNodeResult || {}).filter(k => k.match(/^(prompt|image_size|keyword|seo)\d*$/)));
+          }
+          
+          console.log(`  💾 Stored node result under keys: ${[nodeId, nodeRefName, shortNodeRef, nodeLabel.trim()].filter(k => k).join(', ')}`);
+        }
+
+        // Update execution tracking - node completed
+        if (executionId) {
+          // Get existing result_data to preserve all node results
+          const { data: existingExecution } = await supabase
+            .from('workflow_executions')
+            .select('result_data')
+            .eq('id', executionId)
+            .single();
+          
+          const existingNodeResults = existingExecution?.result_data?.nodeResults || {};
+          
+          const resultDataWithNodes = {
+            nodeCount: Object.keys(accumulatedWorkflowData).length,
+            lastNodeType: nodeType,
+            lastNodeId: nodeId,
+            nodeResults: {
+              ...existingNodeResults,
+              [nodeId]: result
+            },
+            // Store the accumulated workflow data for webhook response access
+            workflowData: accumulatedWorkflowData
+          };
+          
+          await supabase
+            .from('workflow_executions')
+            .update({
+              executed_nodes: Array.from(executedNodes),
+              result_data: resultDataWithNodes
+            })
+            .eq('id', executionId);
+        }
+      }
+      
+      console.log(`✅ Parallel batch ${batchIndex} completed. Available data keys:`, Object.keys(accumulatedWorkflowData));
+      
+      // CORE PARALLEL EXECUTION ALGORITHM: Check for RouterNode with parallel execution
+      const nextBatchNodes = new Set<string>();
+      const parallelBranches = new Map<string, string[]>(); // nodeId -> [branchTargets]
+      
+      // For each currently executed node, analyze for parallel execution patterns
+      for (const nodeId of currentNodes) {
+        const currentNode = nodes.find((n: WorkflowNode) => n.id === nodeId);
+        const connectedEdges = edges.filter((edge: WorkflowEdge) => edge.source === nodeId);
+        
+        console.log(`🔗 Node ${nodeId} (type: ${currentNode?.type}) has ${connectedEdges.length} outgoing connections`);
+        
+        // Branch Discovery: Check if this is a RouterNode with parallel execution mode
+        if (currentNode?.type === 'router' && currentNode.data?.config?.executionMode === 'parallel') {
+          console.log(`🔀 PARALLEL ROUTER DETECTED: ${nodeId} - executing ALL ${connectedEdges.length} branches simultaneously`);
+          
+          // Concurrent Execution: Collect ALL outgoing edges for parallel execution
+          const branchTargets: string[] = [];
+          for (const edge of connectedEdges) {
+            if (!executedNodes.has(edge.target)) {
+              nextBatchNodes.add(edge.target);
+              branchTargets.push(edge.target);
+              console.log(`  🌟 PARALLEL BRANCH: Adding ${edge.target} to parallel execution batch`);
+            }
+          }
+          
+          if (branchTargets.length > 0) {
+            parallelBranches.set(nodeId, branchTargets);
+            console.log(`  📋 Router ${nodeId} will execute branches in parallel: [${branchTargets.join(', ')}]`);
+          }
+        } else {
+          // Regular sequential logic for non-parallel routers and other nodes
+          for (const edge of connectedEdges) {
+            if (!executedNodes.has(edge.target)) {
+              nextBatchNodes.add(edge.target);
+              console.log(`  ➡️  Adding ${edge.target} to next batch (sequential)`);
+            }
+          }
+        }
+      }
+      
+      // Data Distribution: Log parallel branch execution summary
+      if (parallelBranches.size > 0) {
+        console.log(`🚀 PARALLEL EXECUTION SUMMARY:`);
+        for (const [routerId, branches] of parallelBranches) {
+          console.log(`  Router ${routerId}: [${branches.join(', ')}] will receive identical data copies`);
+        }
+      }
+      
+      // Execute next batch (all nodes will run in parallel via Promise.all)
+      if (nextBatchNodes.size > 0) {
+        currentNodes = Array.from(nextBatchNodes);
+        console.log(`🚀 Next batch will execute ${currentNodes.length} nodes in PARALLEL: [${currentNodes.join(', ')}]`);
+      } else {
+        currentNodes = [];
+        console.log(`🏁 No more nodes to execute`);
+      }
+      batchIndex++;
+      
+      if (currentNodes.length > 0) {
+        console.log(`➡️  Moving to next parallel batch: ${currentNodes.join(', ')}`);
+      } else {
+        console.log('🏁 No more nodes to execute');
+      }
+    }
+
+    console.log(`Workflow execution completed. Executed ${executedNodes.size} nodes:`, Array.from(executedNodes));
+
+    // Mark execution as completed
+    if (executionId) {
+      // Get existing result_data to preserve all node results
+      const { data: existingExecution } = await supabase
+        .from('workflow_executions')
+        .select('result_data')
+        .eq('id', executionId)
+        .single();
+      
+      const existingNodeResults = existingExecution?.result_data?.nodeResults || {};
+      
+      // Create a comprehensive completion summary that preserves node results
+      const completionSummary = {
+        totalNodes: Object.keys(accumulatedWorkflowData).length,
+        executedNodeCount: executedNodes.size,
+        completedAt: new Date().toISOString(),
+        status: 'completed',
+        nodeResults: existingNodeResults,
+        // Store the final accumulated workflow data
+        workflowData: accumulatedWorkflowData
+      };
+      
+      await supabase
+        .from('workflow_executions')
+        .update({
+          status: 'completed',
+          completed_at: new Date().toISOString(),
+          result_data: completionSummary,
+          executed_nodes: Array.from(executedNodes)
+        })
+        .eq('id', executionId);
+    }
+
+    return {
+      message: 'Workflow executed successfully',
+      status: 'completed',
+      executedNodes: Array.from(executedNodes),
+      nodeCount: executedNodes.size,
+      executionId: executionId || null,
+      hasWebhookResponse: hasWebhookResponseNode,
+      webhookResponse: webhookResponseResult
+    };
+
+  } catch (error) {
+    console.error('Error processing workflow:', error);
+    
+    // Mark execution as failed
+    if (executionId) {
+      // Get the current list of executed nodes from the existing variable
+      const currentExecutedNodes = Array.from(executedNodes || []);
+      await supabase
+        .from('workflow_executions')
+        .update({
+          status: 'failed',
+          completed_at: new Date().toISOString(),
+          error_message: error.message,
+          executed_nodes: currentExecutedNodes
+        })
+        .eq('id', executionId);
+    }
+    
+    return {
+      error: 'Workflow execution failed',
+      message: error.message,
+      data: accumulatedWorkflowData
+    };
+  }
+}
+
+async function executeNode(node: WorkflowNode, data: any, supabase: any): Promise<any> {
+  console.log(`Executing node type: ${node.type} with data keys:`, Object.keys(data));
+  
+  switch (node.type) {
+    case 'trigger':
+      // Trigger node should expose the webhook data at the top level for easy access
+      console.log('Trigger node executed, passing data through');
+      console.log('🎯 Trigger input data structure:', JSON.stringify(data, null, 2));
+      
+      // Create a flattened result that exposes webhook fields directly
+      const triggerResult = {
+        ...data,
+        // Extract fields from nested structures for direct access
+        ...(data.data || {}),
+        ...(data.originalTriggerData || {}),
+        // Store the original structure as well
+        body: data.data || data.originalTriggerData || data,
+        // Ensure all the numbered prompt and image_size fields are accessible at the top level
+        ...(data.originalTriggerData && typeof data.originalTriggerData === 'object' ? 
+          Object.keys(data.originalTriggerData).reduce((acc, key) => {
+            if (key.match(/^(prompt|image_size|keyword|seo)\d*$/)) {
+              acc[key] = data.originalTriggerData[key];
+            }
+            return acc;
+          }, {}) : {}),
+        // Also extract from the main data object
+        ...(data && typeof data === 'object' ? 
+          Object.keys(data).reduce((acc, key) => {
+            if (key.match(/^(prompt|image_size|keyword|seo)\d*$/)) {
+              acc[key] = data[key];
+            }
+            return acc;
+          }, {}) : {}),
+        // Store webhook request data for display in execution results
+        originalRequest: data.originalTriggerData || data.data || data,
+        webhookData: {
+          request_body: data.originalTriggerData || data.data || data
+        }
+      };
+      
+      console.log(`🎯 Trigger Result keys:`, Object.keys(triggerResult));
+      console.log(`🎯 Found numbered fields in trigger result:`, Object.keys(triggerResult).filter(k => k.match(/^(prompt|image_size|keyword|seo)\d*$/)));
+      return triggerResult;
+
+    case 'gptTask':  // Frontend uses 'gptTask', not 'gpt-task'
+      console.log('Executing GPT Task node');
+      return await executeGPTTask(node, data);
+
+    case 'httpTask':  // Frontend uses 'httpTask', not 'http-task'
+      console.log('Executing HTTP Task node');
+      return await executeHTTPTask(node, data);
+
+    case 'conditional':
+      console.log('Executing Conditional node');
+      return await executeConditional(node, data);
+
+    case 'dataTransform':  // Frontend uses 'dataTransform', not 'data-transform'
+      console.log('Executing Data Transform node');
+      return await executeDataTransform(node, data);
+
+    case 'webhookResponse':  // Frontend uses 'webhookResponse', not 'webhook-response'
+      console.log('Executing Webhook Response node');
+      return await executeWebhookResponse(node, data);
+
+    case 'router':
+      console.log('Executing Router node');
+      return await executeRouter(node, data);
+
+    default:
+      console.log(`Unknown node type: ${node.type}, passing data through`);
+      return data;
+  }
+}
+
+async function executeGPTTask(node: WorkflowNode, data: any): Promise<any> {
+  try {
+    const supabaseUrl = Deno.env.get('SUPABASE_URL');
+    const supabaseAnonKey = Deno.env.get('SUPABASE_ANON_KEY');
+    
+    if (!supabaseUrl || !supabaseAnonKey) {
+      throw new Error('Supabase configuration not found');
+    }
+
+    const config = node.data.config || {};
+    console.log(`🧠 GPT Task executing with resolved config:`, JSON.stringify(config, null, 2));
+
+    // Call the dedicated gpt-task edge function with resolved configuration
+    const response = await fetch(`${supabaseUrl}/functions/v1/gpt-task`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${supabaseAnonKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        config: config,
+        inputs: data // Pass the workflow data as inputs for any remaining parameter substitution
+      }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error('GPT Task function error:', errorText);
+      throw new Error(`GPT Task function error: ${response.status} - ${errorText}`);
+    }
+
+    const result = await response.json();
+    
+    if (result.error) {
+      throw new Error(result.error);
+    }
+
+    console.log(`🧠 GPT Task completed. Response: ${result.result?.substring(0, 50)}...`);
+
+    return {
+      result: result.result,
+      usage: result.usage,
+      model: result.model
+    };
+
+  } catch (error) {
+    console.error('GPT task error:', error);
+    return {
+      error: error.message,
+      result: null
+    };
+  }
+}
+
+async function executeHTTPTask(node: WorkflowNode, data: any): Promise<any> {
+  try {
+    const supabaseUrl = Deno.env.get('SUPABASE_URL');
+    const supabaseAnonKey = Deno.env.get('SUPABASE_ANON_KEY');
+    
+    if (!supabaseUrl || !supabaseAnonKey) {
+      throw new Error('Supabase configuration not found');
+    }
+
+    const config = node.data.config || {};
+    console.log(`🌐 HTTP Task executing with resolved config:`, JSON.stringify(config, null, 2));
+    console.log(`🌐 Available data for parameter replacement:`, Object.keys(data));
+    
+    // Config should already be resolved from main workflow processing
+    const resolvedConfig = config;
+
+    // Call the dedicated http-task edge function with resolved configuration
+    const response = await fetch(`${supabaseUrl}/functions/v1/http-task`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${supabaseAnonKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        config: resolvedConfig
+      }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error('HTTP Task function error:', errorText);
+      throw new Error(`HTTP Task function error: ${response.status} - ${errorText}`);
+    }
+
+    const result = await response.json();
+    console.log(`🌐 HTTP Task result from edge function:`, result);
+
+    // Return the result with proper structure for reference by other nodes
+    return {
+      ...data,
+      response: result.body,  // This is what {{HTTP 1.response}} should reference
+      http_response: result.body,
+      http_status: result.status,
+      http_success: result.success,
+      request_url: resolvedConfig.url,
+      request_method: resolvedConfig.method,
+      request_body: resolvedConfig.body,
+      request_headers: resolvedConfig.headers,
+      full_result: result // Store the complete result for debugging
+    };
+
+  } catch (error) {
+    console.error('🚨 HTTP task error:', error);
+    return {
+      ...data,
+      http_error: error.message,
+      http_success: false,
+      response: null
+    };
+  }
+}
+
+async function executeConditional(node: WorkflowNode, data: any): Promise<any> {
+  // Simple conditional logic - could be expanded
+  const { condition, trueValue, falseValue } = node.data.config || {};
+  
+  // Basic condition evaluation (you could make this more sophisticated)
+  let conditionResult = false;
+  if (condition && typeof data === 'object') {
+    // Simple key existence check
+    conditionResult = Object.keys(data).some(key => condition.includes(key));
+  }
+
+  return {
+    ...data,
+    condition_result: conditionResult,
+    condition_value: conditionResult ? trueValue : falseValue
+  };
+}
+
+async function executeDataTransform(node: WorkflowNode, data: any): Promise<any> {
+  try {
+    const { transformations } = node.data.config || {};
+    let transformedData = { ...data };
+
+    if (transformations && Array.isArray(transformations)) {
+      transformations.forEach((transform: any) => {
+        const { operation, field, value } = transform;
+        
+        switch (operation) {
+          case 'add':
+            transformedData[field] = value;
+            break;
+          case 'remove':
+            delete transformedData[field];
+            break;
+          case 'modify':
+            if (transformedData[field] !== undefined) {
+              transformedData[field] = value;
+            }
+            break;
+        }
+      });
+    }
+
+    return transformedData;
+
+  } catch (error) {
+    console.error('Data transform error:', error);
+    return {
+      ...data,
+      transform_error: error.message
+    };
+  }
+}
+
+async function executeWebhookResponse(node: WorkflowNode, data: any): Promise<any> {
+  // Parse config if it's a string (which it often is)
+  let config = node.data.config || {};
+  if (typeof config === 'string') {
+    try {
+      config = JSON.parse(config);
+    } catch (error) {
+      console.error('Failed to parse webhook response config:', error);
+      config = {};
+    }
+  }
+  
+  const { statusCode = 200, responseBody, headers = {} } = config;
+  
+  console.log(`📤 Webhook Response executed with status: ${statusCode}`);
+  console.log(`📤 Raw response body from config:`, responseBody);
+  
+  // If no response body is configured, return an error
+  if (responseBody === undefined || responseBody === null || responseBody === '') {
+    throw new Error('Webhook response node requires a configured response body');
+  }
+  
+  // Process the response body to replace any remaining parameters
+  let processedResponseBody = responseBody;
+  
+  // Process for parameter replacement based on type
+  if (typeof processedResponseBody === 'string') {
+    // For strings, first try to parse as JSON to get the object structure
+    let bodyAsObject;
+    try {
+      bodyAsObject = JSON.parse(processedResponseBody);
+      // If successful, process the object and then convert back to JSON
+      processedResponseBody = replaceParameters(bodyAsObject, data);
+    } catch (error) {
+      // If not valid JSON, process as string directly
+      console.log('Response body is not valid JSON, processing as string');
+      processedResponseBody = replaceParameters(processedResponseBody, data);
+    }
+  } else if (typeof processedResponseBody === 'object') {
+    // If it's already an object, process it for parameter replacement
+    processedResponseBody = replaceParameters(processedResponseBody, data);
+  }
+  
+  console.log(`📤 Final processed response body:`, JSON.stringify(processedResponseBody).substring(0, 200) + '...');
+  
+  // Return only the configured response body, not accumulated workflow data
+  const result = {
+    webhook_response: {
+      statusCode,
+      body: processedResponseBody,
+      headers
+    },
+    result: processedResponseBody,
+    message: `Webhook response sent with status ${statusCode}`,
+    executedAt: new Date().toISOString()
+  };
+  
+  console.log(`✅ Webhook Response completed successfully`);
+  return result;
+}
+
+async function executeRouter(node: WorkflowNode, data: any): Promise<any> {
+  console.log(`🔀 Router node executing with config:`, node.data.config);
+  
+  // Router node just passes data through - the parallel execution logic
+  // is handled in the main workflow processing where we process multiple edges
+  return data;
+}
