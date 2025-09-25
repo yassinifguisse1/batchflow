@@ -1,11 +1,71 @@
 import "https://deno.land/x/xhr@0.1.0/mod.ts";
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.53.0';
+import type { SupabaseClient as SupabaseClientGeneric } from 'https://esm.sh/@supabase/supabase-js@2.53.0';
+
+// Add Deno type declaration for TypeScript
+interface DenoEnv {
+  get(key: string): string | undefined;
+}
+
+declare const Deno: {
+  env: DenoEnv;
+};
+
+// Type for Supabase client
+type SupabaseClientType = SupabaseClientGeneric<any, 'public', any>;
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-make-apikey',
 };
+
+const NUMBERED_FIELD_PATTERN = /^(prompt|image_size|keyword|seo)\d*$/;
+
+function ensureError(error: unknown): Error {
+  if (error instanceof Error) {
+    return error;
+  }
+
+  try {
+    return new Error(typeof error === 'string' ? error : JSON.stringify(error));
+  } catch {
+    return new Error(String(error));
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function extractNumberedFields(source: unknown): Record<string, unknown> {
+  if (!isRecord(source)) {
+    return {};
+  }
+
+  const entries: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(source)) {
+    if (NUMBERED_FIELD_PATTERN.test(key)) {
+      entries[key] = value;
+    }
+  }
+
+  return entries;
+}
+
+function extractNodeResults(execution: unknown): Record<string, unknown> {
+  if (!isRecord(execution)) {
+    return {};
+  }
+
+  const resultData = execution.result_data;
+  if (!isRecord(resultData)) {
+    return {};
+  }
+
+  const { nodeResults } = resultData;
+  return isRecord(nodeResults) ? nodeResults : {};
+}
 
 interface WebhookData {
   id: string;
@@ -18,14 +78,46 @@ interface WebhookData {
     key: string;
     header: string;
   }>;
-  workflow_data: any;
+  workflow_data: WorkflowData;
   status: string;
+}
+
+interface WorkflowData {
+  nodes: WorkflowNode[];
+  edges: WorkflowEdge[];
+}
+
+interface WorkflowResult {
+  message: string;
+  data: Record<string, unknown>;
+  error?: string | null;
+  status?: string;
+  hasWebhookResponse?: boolean;
+  webhookResponse?: {
+    statusCode: number;
+    body: unknown;
+    headers: Record<string, string>;
+    error?: string;
+  } | null;
+  executedNodes?: string[];
+  nodeCount?: number;
+  executionId?: string | null;
+  httpTaskCount?: number;
+  gptTaskCount?: number;
+  totalParallelTasks?: number;
+  parallelOptimized?: boolean;
 }
 
 interface WorkflowNode {
   id: string;
   type: string;
-  data: any;
+  data: {
+    config?: Record<string, unknown> | unknown;
+    label?: string;
+    nodeNumber?: number;
+    createdAt?: string;
+    [key: string]: unknown;
+  };
   position: { x: number; y: number };
 }
 
@@ -62,7 +154,7 @@ serve(async (req) => {
     console.log(`Processing webhook request for path: ${webhookPath}`);
 
     // Get request body and headers
-    let requestBody: any = {};
+    let requestBody: Record<string, unknown> = {};
     console.log('🔍 Content-Type header:', req.headers.get('content-type'));
     console.log('🔍 Request method:', req.method);
     
@@ -101,7 +193,7 @@ serve(async (req) => {
       ) {
         // Handle both URL-encoded and multipart form data
         const formData = await req.formData();
-        const entries: Record<string, any> = {};
+        const entries: Record<string, unknown> = {};
         for (const [key, value] of formData.entries()) {
           if (value instanceof File) {
             // Serialize files into JSON-safe descriptors
@@ -207,7 +299,7 @@ serve(async (req) => {
     }
 
     // Find and execute workflow automatically
-    let workflowResult = { message: 'Webhook received successfully', data: requestBody, error: null };
+    let workflowResult: WorkflowResult = { message: 'Webhook received successfully', data: requestBody, error: null };
     
     // Look for all workflows that use this webhook
     const { data: workflows, error: workflowError } = await supabase
@@ -225,9 +317,9 @@ serve(async (req) => {
       
       for (const workflow of workflows) {
         if (workflow.workflow_data && workflow.workflow_data.nodes) {
-          const foundTrigger = workflow.workflow_data.nodes.find((node: WorkflowNode) => 
+          const foundTrigger = (workflow as any).workflow_data.nodes.find((node: WorkflowNode) => 
             node.type === 'trigger' && 
-            node.data.config?.selectedHook === webhook.id
+            (node.data.config as any)?.selectedHook === webhook.id
           );
           
           if (foundTrigger) {
@@ -239,8 +331,8 @@ serve(async (req) => {
       }
       
       if (matchingWorkflow && triggerNode) {
-        console.log(`Found matching workflow: ${matchingWorkflow.name} with trigger using webhook ${webhook.id}`);
-        console.log(`Automatically executing workflow: ${matchingWorkflow.name}`);
+        console.log(`Found matching workflow: ${(matchingWorkflow as any).name} with trigger using webhook ${webhook.id}`);
+        console.log(`Automatically executing workflow: ${(matchingWorkflow as any).name}`);
         
         try {
           // Create webhook request first to get ID for execution tracking
@@ -283,11 +375,11 @@ serve(async (req) => {
 
           // Process workflow with early webhook response capability
           workflowResult = await processWorkflowWithEarlyResponse(
-            matchingWorkflow.workflow_data, 
+            (matchingWorkflow as any).workflow_data, 
             enrichedTriggerData, 
             supabase,
             webhookRequestId,
-            matchingWorkflow.id,
+            (matchingWorkflow as any).id,
             webhook.user_id
           );
 
@@ -316,7 +408,7 @@ serve(async (req) => {
           console.error('Workflow execution error:', workflowError);
           workflowResult = { 
             message: 'Workflow execution failed', 
-            error: workflowError.message,
+            error: (workflowError as Error).message,
             data: requestBody 
           };
         }
@@ -325,11 +417,14 @@ serve(async (req) => {
         // Log all trigger configurations for debugging
         workflows.forEach((wf, idx) => {
           if (wf.workflow_data?.nodes) {
-            const triggers = wf.workflow_data.nodes.filter(n => n.type === 'trigger');
-            console.log(`Workflow ${idx} (${wf.name}) triggers:`, triggers.map(t => ({ 
-              selectedHook: t.data?.config?.selectedHook, 
-              triggerType: t.data?.config?.triggerType 
-            })));
+            const triggers = wf.workflow_data.nodes.filter((n: WorkflowNode) => n.type === 'trigger');
+            console.log(`Workflow ${idx} (${wf.name}) triggers:`, triggers.map((t: WorkflowNode) => {
+              const config = isRecord(t.data?.config) ? t.data?.config : {};
+              return {
+                selectedHook: config.selectedHook,
+                triggerType: config.triggerType
+              };
+            }));
           }
         });
       }
@@ -343,8 +438,8 @@ serve(async (req) => {
     console.log(`Webhook processed successfully in ${finalProcessingTime}ms`);
 
     // Return custom response if workflow has webhook response node
-    if (workflowResult?.hasWebhookResponse && workflowResult.webhookResponse) {
-      const webhookResponse = workflowResult.webhookResponse;
+    if ((workflowResult as any)?.hasWebhookResponse && (workflowResult as any).webhookResponse) {
+      const webhookResponse = (workflowResult as any).webhookResponse;
       
       // Handle error responses in webhook response
       if (webhookResponse.error) {
@@ -410,11 +505,12 @@ serve(async (req) => {
     console.error('Error processing webhook:', error);
     
     const processingTime = Date.now() - startTime;
+    const err = ensureError(error);
     
     return new Response(
       JSON.stringify({ 
         error: 'Internal server error',
-        message: error.message 
+        message: err.message 
       }),
       { 
         status: 500, 
@@ -425,7 +521,7 @@ serve(async (req) => {
 });
 
 // Global parameter replacement function
-function replaceParameters(template: any, workflowData: any): any {
+function replaceParameters(template: unknown, workflowData: Record<string, unknown>): unknown {
   if (!template) return template;
   
   // If it's not a string, recursively process objects/arrays
@@ -433,7 +529,7 @@ function replaceParameters(template: any, workflowData: any): any {
     if (Array.isArray(template)) {
       return template.map(item => replaceParameters(item, workflowData));
     } else {
-      const result: any = {};
+      const result: Record<string, unknown> = {};
       for (const [key, value] of Object.entries(template)) {
         result[key] = replaceParameters(value, workflowData);
       }
@@ -457,7 +553,7 @@ function replaceParameters(template: any, workflowData: any): any {
     const inJsonQuotes = prevChar === '"' && nextChar === '"';
 
     // Serialize a value safely for JSON templates
-    const serializeForContext = (val: any) => {
+    const serializeForContext = (val: unknown) => {
       // When placeholder is inside quotes → escape the content but don't add extra quotes
       if (inJsonQuotes) {
         if (val === null || val === undefined) return '';
@@ -498,8 +594,9 @@ function replaceParameters(template: any, workflowData: any): any {
         }
         
         // Also check in the original request body
-        if (workflowData.originalRequest && Object.prototype.hasOwnProperty.call(workflowData.originalRequest, fieldName)) {
-          const value = workflowData.originalRequest[fieldName];
+        const originalRequest = isRecord(workflowData.originalRequest) ? workflowData.originalRequest : null;
+        if (originalRequest && Object.prototype.hasOwnProperty.call(originalRequest, fieldName)) {
+          const value = originalRequest[fieldName];
           const out = serializeForContext(value);
           console.log(`✅ Found field "${fieldName}" in originalRequest - Replaced ${match} with: ${out.substring(0, 100)}`);
           return out;
@@ -520,12 +617,13 @@ function replaceParameters(template: any, workflowData: any): any {
         console.log(`🔍 Available keys:`, Object.keys(workflowData).join(', '));
         
         for (const key of sortedTriggerKeys) {
-          if (workflowData[key] && typeof workflowData[key] === 'object') {
+          const triggerData = workflowData[key];
+          if (isRecord(triggerData)) {
             console.log(`🔍 Property access match: "${key}" -> "${fieldName}"`);
-            console.log(`❌ Available in current object:`, Object.keys(workflowData[key] || {}));
+            console.log(`❌ Available in current object:`, Object.keys(triggerData));
             
-            if (fieldName in workflowData[key]) {
-              const value = workflowData[key][fieldName];
+            if (fieldName in triggerData) {
+              const value = triggerData[fieldName];
               const out = serializeForContext(value);
               console.log(`✅ Found in ${key}.${fieldName} - Replaced ${match} with: ${out.substring(0, 100)}`);
               return out;
@@ -542,7 +640,7 @@ function replaceParameters(template: any, workflowData: any): any {
       }
 
       // Handle nested property access like "GPT 1.result" or "Trigger 1.body"
-      let value: any = workflowData;
+      let value: unknown = workflowData;
       let currentPath = trimmedExpr;
       
       // Sort keys prioritizing exact numeric matches first, then by length
@@ -591,19 +689,18 @@ function replaceParameters(template: any, workflowData: any): any {
         const [nodePrefix, property] = trimmedExpr.split('.', 2);
         
         // For GPT references like "GPT 1.result", "GPT 4.result", etc.
-        if (nodePrefix.toLowerCase().includes('gpt')) {
+        if (typeof nodePrefix === 'string' && nodePrefix.toLowerCase().includes('gpt')) {
           console.log(`🔍 Looking for GPT node matching "${nodePrefix}" with property "${property}"`);
 
           const requestedNumMatch = nodePrefix.match(/(\d+)$/);
           const requestedNum = requestedNumMatch ? Number(requestedNumMatch[1]) : null;
-          const wordBoundaryNum = (key: string, num: number) => new RegExp(`\\b${num}\\b`).test(key);
-
           // All GPT-related keys that expose the requested property
           const gptKeys = sortedKeys.filter((key) => {
             const keyLower = key.toLowerCase();
             const isGptKey = keyLower.includes('gpt');
             if (!isGptKey) return false;
-            const hasProp = workflowData[key] && typeof workflowData[key] === 'object' && (property in workflowData[key]);
+            const candidate = workflowData[key];
+            const hasProp = isRecord(candidate) && property in candidate;
             return hasProp;
           });
 
@@ -691,12 +788,14 @@ function replaceParameters(template: any, workflowData: any): any {
       if (currentPath && currentPath.length > 0) {
         const parts = currentPath.split('.');
         for (const part of parts) {
-          if (value && typeof value === 'object' && part in value) {
+          if (isRecord(value) && part in value) {
             value = value[part];
-            console.log(`🔍 Found nested property "${part}":`, typeof value === 'string' ? (value as string).substring(0, 100) : value);
+            const preview = typeof value === 'string' ? (value as string).substring(0, 100) : value;
+            console.log(`🔍 Found nested property "${part}":`, preview);
           } else {
             console.log(`❌ Path not found: ${trimmedExpr} (missing: ${part})`);
-            console.log(`❌ Available in current object:`, typeof value === 'object' ? Object.keys(value || {}) : 'not an object');
+            const availableKeys = isRecord(value) ? Object.keys(value) : 'not an object';
+            console.log('❌ Available in current object:', availableKeys);
             return inJsonQuotes ? '' : '""'; // Return safe value for missing fields
           }
         }
@@ -749,7 +848,14 @@ function replaceParameters(template: any, workflowData: any): any {
 }
 
 // New function that waits for all parallel HTTP tasks before webhook response
-async function processWorkflowWithEarlyResponse(workflowData: any, inputData: any, supabase: any, webhookRequestId?: string, workflowId?: string, userId?: string): Promise<any> {
+async function processWorkflowWithEarlyResponse(
+  workflowData: WorkflowData, 
+  inputData: Record<string, unknown>, 
+  supabase: SupabaseClientType, 
+  webhookRequestId?: string, 
+  workflowId?: string, 
+  userId?: string
+): Promise<WorkflowResult> {
   const { nodes, edges } = workflowData;
   
   // Check if workflow has webhook response node
@@ -773,9 +879,9 @@ async function processWorkflowWithEarlyResponse(workflowData: any, inputData: an
   }
 
   // Process workflow with parallel HTTP optimization
-  let webhookResponseResult = null;
-  let executionId = null;
-  let accumulatedWorkflowData: any = {
+  let webhookResponseResult: WorkflowResult['webhookResponse'] | null = null;
+  let executionId: string | null = null;
+  let accumulatedWorkflowData: Record<string, unknown> = {
     originalTriggerData: inputData,
     trigger: inputData,
     data: inputData,
@@ -808,7 +914,16 @@ async function processWorkflowWithEarlyResponse(workflowData: any, inputData: an
         .single();
 
       if (execution && !execError) {
-        executionId = execution.id;
+        const executionIdentifier = typeof execution.id === 'string'
+          ? execution.id
+          : execution.id != null
+            ? String(execution.id)
+            : null;
+
+        if (executionIdentifier) {
+          executionId = executionIdentifier;
+        }
+
         console.log('🚀 Created workflow execution record:', executionId);
       }
     }
@@ -825,13 +940,19 @@ async function processWorkflowWithEarlyResponse(workflowData: any, inputData: an
     // Execute trigger node
     console.log('⚡ Executing trigger node');
     executedNodes.add(triggerNode.id);
-    const triggerResult = await executeNode(triggerNode, accumulatedWorkflowData, supabase);
+    const triggerResult = await executeNode(triggerNode as WorkflowNode, accumulatedWorkflowData, supabase);
     if (triggerResult) {
       accumulatedWorkflowData = { ...accumulatedWorkflowData, ...triggerResult };
     }
 
     // Execute all parallel task groups (HTTP and GPT)
-    const allParallelTasks: Promise<any>[] = [];
+    const allParallelTasks: Promise<{
+      nodeId: string;
+      node: WorkflowNode;
+      result: unknown;
+      failed?: boolean;
+      taskType: 'httpTask' | 'gptTask';
+    } | null>[] = [];
     
     // Add HTTP tasks
     for (const httpGroup of parallelHttpGroups) {
@@ -873,19 +994,19 @@ async function processWorkflowWithEarlyResponse(workflowData: any, inputData: an
               status: 'failed',
               error_details: {
                 failed_node_id: nodeId,
-                error_message: result?.error || `${taskType} task failed`
+                error_message: (result as any)?.error || `${taskType} task failed`
               }
             })
             .eq('id', executionId);
         }
         
-        throw new Error(`${taskType} task ${nodeId} failed: ${result?.error}`);
+        throw new Error(`${taskType} task ${nodeId} failed: ${(result as any)?.error}`);
       }
 
       // Store result with proper indexing
       if (result && typeof result === 'object') {
         const safeNodeResult = JSON.parse(JSON.stringify(result));
-        const nodeLabel = node.data?.label || node.data?.config?.label || '';
+        const nodeLabel = (node.data?.label as string) || (node.data?.config as any)?.label || '';
         
         if (taskType === 'httpTask') {
           // Get or increment the count for HTTP tasks
@@ -899,7 +1020,7 @@ async function processWorkflowWithEarlyResponse(workflowData: any, inputData: an
           accumulatedWorkflowData[`HTTP Task ${nodeIndex}`] = safeNodeResult;
           
           // Store under label if exists
-          if (nodeLabel.trim()) {
+          if (typeof nodeLabel === 'string' && nodeLabel.trim()) {
             accumulatedWorkflowData[nodeLabel.trim()] = safeNodeResult;
           }
           
@@ -921,7 +1042,7 @@ async function processWorkflowWithEarlyResponse(workflowData: any, inputData: an
           accumulatedWorkflowData[`GPT Task ${nodeIndex}`] = safeNodeResult;
           
           // Store under label if exists
-          if (nodeLabel.trim()) {
+          if (typeof nodeLabel === 'string' && nodeLabel.trim()) {
             accumulatedWorkflowData[nodeLabel.trim()] = safeNodeResult;
           }
           
@@ -931,9 +1052,10 @@ async function processWorkflowWithEarlyResponse(workflowData: any, inputData: an
           }
           
           console.log(`💾 Stored GPT result as "GPT ${nodeIndex}" with result:`, 
-            typeof result.result === 'string' 
-              ? result.result.substring(0, 100) + '...'
-              : result.result
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            typeof (result as any).result === 'string' 
+              ? (result as any).result.substring(0, 100) + '...'
+              : (result as any).result
           );
         }
       }
@@ -970,10 +1092,10 @@ async function processWorkflowWithEarlyResponse(workflowData: any, inputData: an
       }
     };
 
-    const webhookResult = await executeNode(resolvedWebhookNode, accumulatedWorkflowData, supabase);
+    const webhookResult = await executeNode(resolvedWebhookNode as WorkflowNode, accumulatedWorkflowData, supabase);
     
-    if (webhookResult?.webhook_response) {
-      webhookResponseResult = webhookResult.webhook_response;
+    if ((webhookResult as any)?.webhook_response) {
+      webhookResponseResult = (webhookResult as any).webhook_response;
       console.log('🎯 WEBHOOK RESPONSE with all HTTP results:', webhookResponseResult);
     }
 
@@ -1000,6 +1122,7 @@ async function processWorkflowWithEarlyResponse(workflowData: any, inputData: an
 
     return {
       message: 'Workflow completed with parallel HTTP and GPT optimization',
+      data: accumulatedWorkflowData,
       status: 'completed',
       executedNodes: Array.from(executedNodes),
       nodeCount: executedNodes.size,
@@ -1014,23 +1137,24 @@ async function processWorkflowWithEarlyResponse(workflowData: any, inputData: an
 
   } catch (error) {
     console.error('❌ Parallel HTTP workflow failed:', error);
+    const err = ensureError(error);
     
     if (executionId) {
       await supabase
         .from('workflow_executions')
         .update({
           status: 'failed',
-          error_message: error.message
+          error_message: err.message
         })
         .eq('id', executionId);
     }
     
-    throw error;
+    throw err;
   }
 }
 
 // Helper function to find parallel GPT task groups
-function findParallelGptGroups(nodes: WorkflowNode[], edges: any[], webhookResponseNodeId: string): string[][] {
+function findParallelGptGroups(nodes: WorkflowNode[], edges: WorkflowEdge[], webhookResponseNodeId: string): string[][] {
   const gptNodes = nodes.filter(node => node.type === 'gptTask');
   
   // Filter GPT nodes that have a path to webhook response
@@ -1052,12 +1176,18 @@ function findParallelGptGroups(nodes: WorkflowNode[], edges: any[], webhookRespo
 async function executeParallelTask(
   nodeId: string, 
   nodes: WorkflowNode[], 
-  accumulatedWorkflowData: any, 
+  accumulatedWorkflowData: Record<string, unknown>, 
   executedNodes: Set<string>, 
   executionId: string | null, 
-  supabase: any,
+  supabase: SupabaseClientType,
   taskType: 'httpTask' | 'gptTask'
-) {
+): Promise<{
+  nodeId: string;
+  node: WorkflowNode;
+  result: unknown;
+  failed?: boolean;
+  taskType: 'httpTask' | 'gptTask';
+} | null> {
   const node = nodes.find((n: WorkflowNode) => n.id === nodeId);
   if (!node) return null;
 
@@ -1097,11 +1227,12 @@ async function executeParallelTask(
       taskType
     };
   } catch (error) {
+    const err = ensureError(error);
     console.error(`❌ Parallel ${taskType} ${nodeId} failed:`, error);
     return {
       nodeId,
       node,
-      result: { error: error.message },
+      result: { error: err.message },
       failed: true,
       taskType
     };
@@ -1109,7 +1240,7 @@ async function executeParallelTask(
 }
 
 // Helper function to find parallel HTTP task groups  
-function findParallelHttpGroups(nodes: WorkflowNode[], edges: any[], webhookResponseNodeId: string): string[][] {
+function findParallelHttpGroups(nodes: WorkflowNode[], edges: WorkflowEdge[], webhookResponseNodeId: string): string[][] {
   const httpNodes = nodes.filter(node => node.type === 'httpTask');
   if (httpNodes.length === 0) return [];
   
@@ -1157,7 +1288,7 @@ function findParallelHttpGroups(nodes: WorkflowNode[], edges: any[], webhookResp
 }
 
 // Helper function to check if there's a path from source to target
-function hasPathToTarget(edges: any[], sourceId: string, targetId: string): boolean {
+function hasPathToTarget(edges: WorkflowEdge[], sourceId: string, targetId: string): boolean {
   const visited = new Set<string>();
   
   function dfs(currentId: string): boolean {
@@ -1178,7 +1309,7 @@ function hasPathToTarget(edges: any[], sourceId: string, targetId: string): bool
 }
 
 // Helper function to get node depth from trigger
-function getNodeDepthFromTrigger(nodes: WorkflowNode[], edges: any[], nodeId: string): number {
+function getNodeDepthFromTrigger(nodes: WorkflowNode[], edges: WorkflowEdge[], nodeId: string): number {
   const triggerNode = nodes.find(node => node.type === 'trigger');
   if (!triggerNode) return 0;
   
@@ -1203,7 +1334,7 @@ function getNodeDepthFromTrigger(nodes: WorkflowNode[], edges: any[], nodeId: st
 }
 
 // Helper function to build execution order from trigger to webhook response node
-async function buildExecutionOrderToWebhookResponse(nodes: WorkflowNode[], edges: any[], startNodeId: string, targetNodeId: string): Promise<string[]> {
+async function buildExecutionOrderToWebhookResponse(nodes: WorkflowNode[], edges: WorkflowEdge[], startNodeId: string, targetNodeId: string): Promise<string[]> {
   const visited = new Set<string>();
   const executionOrder: string[] = [];
   
@@ -1238,10 +1369,10 @@ async function buildExecutionOrderToWebhookResponse(nodes: WorkflowNode[], edges
 // Background processing function
 async function continueWorkflowInBackground(
   remainingNodes: WorkflowNode[], 
-  edges: any[], 
-  accumulatedWorkflowData: any, 
+  edges: WorkflowEdge[], 
+  accumulatedWorkflowData: Record<string, unknown>, 
   executedNodes: Set<string>, 
-  supabase: any, 
+  supabase: SupabaseClientType, 
   executionId: string | null,
   nodeTypeCounts: Map<string, number>
 ): Promise<void> {
@@ -1297,13 +1428,14 @@ async function continueWorkflowInBackground(
     
   } catch (error) {
     console.error('❌ Background processing failed:', error);
+    const err = ensureError(error);
     
     if (executionId) {
       await supabase
         .from('workflow_executions')
         .update({
           status: 'failed',
-          error_message: `Background processing failed: ${error.message}`
+          error_message: `Background processing failed: ${err.message}`
         })
         .eq('id', executionId);
     }
@@ -1311,7 +1443,14 @@ async function continueWorkflowInBackground(
 }
 
 // Original processWorkflow function (kept for workflows without webhook response nodes)
-async function processWorkflow(workflowData: any, inputData: any, supabase: any, webhookRequestId?: string, workflowId?: string, userId?: string): Promise<any> {
+async function processWorkflow(
+  workflowData: WorkflowData, 
+  inputData: Record<string, unknown>, 
+  supabase: SupabaseClientType, 
+  webhookRequestId?: string, 
+  workflowId?: string, 
+  userId?: string
+): Promise<WorkflowResult> {
   const { nodes, edges } = workflowData;
   
   // Precompute GPT node numbering maps (prefer stored nodeNumber, fallback to creation order by id)
@@ -1339,7 +1478,7 @@ async function processWorkflow(workflowData: any, inputData: any, supabase: any,
   const hasWebhookResponseNode = nodes.some((node: WorkflowNode) => node.type === 'webhookResponse');
   
   // Initialize workflow data that accumulates results from each node
-  let accumulatedWorkflowData: any = {
+  const accumulatedWorkflowData: Record<string, unknown> = {
     originalTriggerData: inputData,
     trigger: inputData,
     data: inputData,
@@ -1374,8 +1513,9 @@ async function processWorkflow(workflowData: any, inputData: any, supabase: any,
   console.log('🎯 Trigger 3 contains:', Object.keys(accumulatedWorkflowData['Trigger 3'] || {}));
   console.log('🎯 Trigger 3 data sample:', JSON.stringify(accumulatedWorkflowData['Trigger 3'], null, 2).substring(0, 500));
   
-  let executionId = null;
-  let webhookResponseResult = null;
+  let executionId: string | null = null;
+  let webhookResponseResult: WorkflowResult['webhookResponse'] | null = null;
+  const executedNodes = new Set<string>();
   
   try {
     // Create workflow execution record for real-time tracking
@@ -1394,7 +1534,16 @@ async function processWorkflow(workflowData: any, inputData: any, supabase: any,
         .single();
 
       if (execution && !execError) {
-        executionId = execution.id;
+        const executionIdentifier = typeof execution.id === 'string'
+          ? execution.id
+          : execution.id != null
+            ? String(execution.id)
+            : null;
+
+        if (executionIdentifier) {
+          executionId = executionIdentifier;
+        }
+
         console.log('Created workflow execution record:', executionId);
       }
     }
@@ -1407,7 +1556,6 @@ async function processWorkflow(workflowData: any, inputData: any, supabase: any,
     }
 
     // Execute nodes with automatic parallel/sequential detection based on connections
-    const executedNodes = new Set<string>();
     let batchIndex = 1;
     
     // Keep track of node counts by type for proper labeling
@@ -1437,7 +1585,7 @@ async function processWorkflow(workflowData: any, inputData: any, supabase: any,
       const parallelResults = await Promise.all(
         nodesToExecute.map(async (currentNode) => {
           if (executedNodes.has(currentNode.id)) {
-            return { nodeId: currentNode.id, result: null, skipped: true };
+            return { nodeId: currentNode.id, result: null, skipped: true, nodeType: currentNode.type, node: currentNode };
           }
           
           console.log(`  ⚡ Starting ${currentNode.type} (${currentNode.id})`);
@@ -1458,18 +1606,18 @@ async function processWorkflow(workflowData: any, inputData: any, supabase: any,
 
           try {
             // 1. Clone and resolve node configuration with parameter replacement
-            const resolvedNode = {
+            const resolvedNode: WorkflowNode = {
               ...currentNode,
               data: {
                 ...currentNode.data,
-                config: replaceParameters(currentNode.data?.config, accumulatedWorkflowData)
+                config: replaceParameters(currentNode.data?.config, accumulatedWorkflowData) as Record<string, unknown>
               }
             };
             
             console.log(`  📝 Node ${currentNode.id} resolved config:`, JSON.stringify(resolvedNode.data.config, null, 2));
 
             // 2. Execute the node with resolved configuration
-            const nodeResult = await executeNode(resolvedNode, accumulatedWorkflowData, supabase);
+            const nodeResult = await executeNode(resolvedNode as WorkflowNode, accumulatedWorkflowData, supabase);
             
             console.log(`  ✅ Node ${currentNode.type} (${currentNode.id}) completed`);
             
@@ -1480,11 +1628,12 @@ async function processWorkflow(workflowData: any, inputData: any, supabase: any,
               node: currentNode
             };
           } catch (error) {
+            const err = ensureError(error);
             console.error(`  ❌ Node ${currentNode.type} (${currentNode.id}) failed:`, error);
             return {
               nodeId: currentNode.id,
               nodeType: currentNode.type,
-              result: { error: error.message },
+              result: { error: err.message },
               node: currentNode,
               failed: true
             };
@@ -1535,8 +1684,8 @@ async function processWorkflow(workflowData: any, inputData: any, supabase: any,
         
         // 4. Check if this is a webhook response node
         if (nodeType === 'webhookResponse') {
-          if (result?.webhook_response) {
-            webhookResponseResult = result.webhook_response;
+          if ((result as any)?.webhook_response) {
+            webhookResponseResult = (result as any).webhook_response;
             console.log(`🎯 Found webhook response from node ${nodeId}:`, webhookResponseResult);
           }
         }
@@ -1552,7 +1701,7 @@ async function processWorkflow(workflowData: any, inputData: any, supabase: any,
           const safeNodeResult = JSON.parse(JSON.stringify(result));
           
           // Get the node label from node data
-          const nodeLabel = node.data?.label || node.data?.config?.label || '';
+          const nodeLabel = (node as any).data?.label || (node as any).data?.config?.label || '';
           
           // Store result with multiple reference patterns
           const nodeRefName = `${nodeType.charAt(0).toUpperCase() + nodeType.slice(1)} ${nodeIndex}`;
@@ -1595,8 +1744,8 @@ async function processWorkflow(workflowData: any, inputData: any, supabase: any,
             }
             
             // If no number from label, use nodeNumber from data
-            if (!nodeNumber && node.data?.nodeNumber) {
-              nodeNumber = node.data.nodeNumber;
+            if (!nodeNumber && (node as any).data?.nodeNumber) {
+              nodeNumber = (node as any).data.nodeNumber as number;
             }
             
             // Try to extract from node ID as fallback (in case it contains a number)
@@ -1614,8 +1763,8 @@ async function processWorkflow(workflowData: any, inputData: any, supabase: any,
                 .filter((n: WorkflowNode) => n.type === 'gptTask')
                 .sort((a: WorkflowNode, b: WorkflowNode) => {
                   // Sort by node creation timestamp if available, otherwise by ID
-                  const aTime = a.data?.createdAt || a.id;
-                  const bTime = b.data?.createdAt || b.id;
+                  const aTime = (a as any).data?.createdAt || a.id;
+                  const bTime = (b as any).data?.createdAt || b.id;
                   return aTime.localeCompare(bTime);
                 });
               
@@ -1627,11 +1776,11 @@ async function processWorkflow(workflowData: any, inputData: any, supabase: any,
               nodeId,
               nodeLabel: nodeLabel.trim(),
               extractedFromLabel: nodeLabel.trim().match(/(\d+)/)?.[1],
-              nodeDataNumber: node.data?.nodeNumber,
+              nodeDataNumber: (node as any).data?.nodeNumber,
               idExtracted: nodeId.match(/(\d+)/)?.[1],
               fallbackNodeIndex: nodeIndex,
               finalNodeNumber: nodeNumber,
-              dataKeys: Object.keys(node.data || {})
+              dataKeys: Object.keys((node as any).data || {})
             });
             
             // Store under the exact node number that appears in the UI
@@ -1706,7 +1855,7 @@ async function processWorkflow(workflowData: any, inputData: any, supabase: any,
             .eq('id', executionId)
             .single();
           
-          const existingNodeResults = existingExecution?.result_data?.nodeResults || {};
+          const existingNodeResults = extractNodeResults(existingExecution);
           
           const resultDataWithNodes = {
             nodeCount: Object.keys(accumulatedWorkflowData).length,
@@ -1744,7 +1893,7 @@ async function processWorkflow(workflowData: any, inputData: any, supabase: any,
         console.log(`🔗 Node ${nodeId} (type: ${currentNode?.type}) has ${connectedEdges.length} outgoing connections`);
         
         // Branch Discovery: Check if this is a RouterNode with parallel execution mode
-        if (currentNode?.type === 'router' && currentNode.data?.config?.executionMode === 'parallel') {
+        if (currentNode?.type === 'router' && (currentNode.data?.config as any)?.executionMode === 'parallel') {
           console.log(`🔀 PARALLEL ROUTER DETECTED: ${nodeId} - executing ALL ${connectedEdges.length} branches simultaneously`);
           
           // Concurrent Execution: Collect ALL outgoing edges for parallel execution
@@ -1808,7 +1957,7 @@ async function processWorkflow(workflowData: any, inputData: any, supabase: any,
         .eq('id', executionId)
         .single();
       
-      const existingNodeResults = existingExecution?.result_data?.nodeResults || {};
+      const existingNodeResults = extractNodeResults(existingExecution);
       
       // Create a comprehensive completion summary that preserves node results
       const completionSummary = {
@@ -1834,6 +1983,7 @@ async function processWorkflow(workflowData: any, inputData: any, supabase: any,
 
     return {
       message: 'Workflow executed successfully',
+      data: accumulatedWorkflowData,
       status: 'completed',
       executedNodes: Array.from(executedNodes),
       nodeCount: executedNodes.size,
@@ -1844,17 +1994,17 @@ async function processWorkflow(workflowData: any, inputData: any, supabase: any,
 
   } catch (error) {
     console.error('Error processing workflow:', error);
+    const err = ensureError(error);
     
     // Mark execution as failed
     if (executionId) {
-      // Get the current list of executed nodes from the existing variable
-      const currentExecutedNodes = Array.from(executedNodes || []);
+      const currentExecutedNodes = Array.from(executedNodes);
       await supabase
         .from('workflow_executions')
         .update({
           status: 'failed',
           completed_at: new Date().toISOString(),
-          error_message: error.message,
+          error_message: err.message,
           executed_nodes: currentExecutedNodes
         })
         .eq('id', executionId);
@@ -1862,55 +2012,49 @@ async function processWorkflow(workflowData: any, inputData: any, supabase: any,
     
     return {
       error: 'Workflow execution failed',
-      message: error.message,
+      message: err.message,
       data: accumulatedWorkflowData
     };
   }
 }
 
-async function executeNode(node: WorkflowNode, data: any, supabase: any): Promise<any> {
+async function executeNode(node: WorkflowNode, data: Record<string, unknown>, supabase: SupabaseClientType): Promise<unknown> {
   console.log(`Executing node type: ${node.type} with data keys:`, Object.keys(data));
   
   switch (node.type) {
-    case 'trigger':
+    case 'trigger': {
       // Trigger node should expose the webhook data at the top level for easy access
       console.log('Trigger node executed, passing data through');
       console.log('🎯 Trigger input data structure:', JSON.stringify(data, null, 2));
       
       // Create a flattened result that exposes webhook fields directly
-      const triggerResult = {
+      const rawNestedData = data.data;
+      const nestedData = isRecord(rawNestedData) ? rawNestedData : {};
+      const rawOriginalTriggerData = data.originalTriggerData;
+      const originalTriggerData = isRecord(rawOriginalTriggerData) ? rawOriginalTriggerData : {};
+      const originalRequestData = Object.keys(originalTriggerData).length > 0 ? originalTriggerData : data;
+      const bodySource = Object.keys(nestedData).length > 0 ? nestedData : originalRequestData;
+      const numberedFieldValues = {
+        ...extractNumberedFields(originalTriggerData),
+        ...extractNumberedFields(data)
+      };
+
+      const triggerResult: Record<string, unknown> = {
         ...data,
-        // Extract fields from nested structures for direct access
-        ...(data.data || {}),
-        ...(data.originalTriggerData || {}),
-        // Store the original structure as well
-        body: data.data || data.originalTriggerData || data,
-        // Ensure all the numbered prompt and image_size fields are accessible at the top level
-        ...(data.originalTriggerData && typeof data.originalTriggerData === 'object' ? 
-          Object.keys(data.originalTriggerData).reduce((acc, key) => {
-            if (key.match(/^(prompt|image_size|keyword|seo)\d*$/)) {
-              acc[key] = data.originalTriggerData[key];
-            }
-            return acc;
-          }, {}) : {}),
-        // Also extract from the main data object
-        ...(data && typeof data === 'object' ? 
-          Object.keys(data).reduce((acc, key) => {
-            if (key.match(/^(prompt|image_size|keyword|seo)\d*$/)) {
-              acc[key] = data[key];
-            }
-            return acc;
-          }, {}) : {}),
-        // Store webhook request data for display in execution results
-        originalRequest: data.originalTriggerData || data.data || data,
+        ...nestedData,
+        ...originalTriggerData,
+        ...numberedFieldValues,
+        body: bodySource,
+        originalRequest: originalRequestData,
         webhookData: {
-          request_body: data.originalTriggerData || data.data || data
+          request_body: originalRequestData
         }
       };
       
       console.log(`🎯 Trigger Result keys:`, Object.keys(triggerResult));
       console.log(`🎯 Found numbered fields in trigger result:`, Object.keys(triggerResult).filter(k => k.match(/^(prompt|image_size|keyword|seo)\d*$/)));
       return triggerResult;
+    }
 
     case 'gptTask':  // Frontend uses 'gptTask', not 'gpt-task'
       console.log('Executing GPT Task node');
@@ -1942,7 +2086,7 @@ async function executeNode(node: WorkflowNode, data: any, supabase: any): Promis
   }
 }
 
-async function executeGPTTask(node: WorkflowNode, data: any): Promise<any> {
+async function executeGPTTask(node: WorkflowNode, data: Record<string, unknown>): Promise<unknown> {
   try {
     const supabaseUrl = Deno.env.get('SUPABASE_URL');
     const supabaseAnonKey = Deno.env.get('SUPABASE_ANON_KEY');
@@ -1989,14 +2133,15 @@ async function executeGPTTask(node: WorkflowNode, data: any): Promise<any> {
 
   } catch (error) {
     console.error('GPT task error:', error);
+    const err = ensureError(error);
     return {
-      error: error.message,
+      error: err.message,
       result: null
     };
   }
 }
 
-async function executeHTTPTask(node: WorkflowNode, data: any): Promise<any> {
+async function executeHTTPTask(node: WorkflowNode, data: Record<string, unknown>): Promise<unknown> {
   try {
     const supabaseUrl = Deno.env.get('SUPABASE_URL');
     const supabaseAnonKey = Deno.env.get('SUPABASE_ANON_KEY');
@@ -2005,7 +2150,7 @@ async function executeHTTPTask(node: WorkflowNode, data: any): Promise<any> {
       throw new Error('Supabase configuration not found');
     }
 
-    const config = node.data.config || {};
+    const config = (node.data.config as Record<string, unknown>) || {};
     console.log(`🌐 HTTP Task executing with resolved config:`, JSON.stringify(config, null, 2));
     console.log(`🌐 Available data for parameter replacement:`, Object.keys(data));
     
@@ -2036,31 +2181,32 @@ async function executeHTTPTask(node: WorkflowNode, data: any): Promise<any> {
     // Return the result with proper structure for reference by other nodes
     return {
       ...data,
-      response: result.body,  // This is what {{HTTP 1.response}} should reference
-      http_response: result.body,
-      http_status: result.status,
-      http_success: result.success,
-      request_url: resolvedConfig.url,
-      request_method: resolvedConfig.method,
-      request_body: resolvedConfig.body,
-      request_headers: resolvedConfig.headers,
+      response: (result as any).body,  // This is what {{HTTP 1.response}} should reference
+      http_response: (result as any).body,
+      http_status: (result as any).status,
+      http_success: (result as any).success,
+      request_url: (resolvedConfig as any).url,
+      request_method: (resolvedConfig as any).method,
+      request_body: (resolvedConfig as any).body,
+      request_headers: (resolvedConfig as any).headers,
       full_result: result // Store the complete result for debugging
     };
 
   } catch (error) {
     console.error('🚨 HTTP task error:', error);
+    const err = ensureError(error);
     return {
       ...data,
-      http_error: error.message,
+      http_error: err.message,
       http_success: false,
       response: null
     };
   }
 }
 
-async function executeConditional(node: WorkflowNode, data: any): Promise<any> {
+async function executeConditional(node: WorkflowNode, data: Record<string, unknown>): Promise<unknown> {
   // Simple conditional logic - could be expanded
-  const { condition, trueValue, falseValue } = node.data.config || {};
+  const { condition, trueValue, falseValue } = (node.data.config as any) || {};
   
   // Basic condition evaluation (you could make this more sophisticated)
   let conditionResult = false;
@@ -2076,13 +2222,13 @@ async function executeConditional(node: WorkflowNode, data: any): Promise<any> {
   };
 }
 
-async function executeDataTransform(node: WorkflowNode, data: any): Promise<any> {
+async function executeDataTransform(node: WorkflowNode, data: Record<string, unknown>): Promise<unknown> {
   try {
-    const { transformations } = node.data.config || {};
-    let transformedData = { ...data };
+    const { transformations } = (node.data.config as any) || {};
+    const transformedData = { ...data };
 
     if (transformations && Array.isArray(transformations)) {
-      transformations.forEach((transform: any) => {
+        transformations.forEach((transform: { operation: string; field: string; value: unknown }) => {
         const { operation, field, value } = transform;
         
         switch (operation) {
@@ -2105,14 +2251,15 @@ async function executeDataTransform(node: WorkflowNode, data: any): Promise<any>
 
   } catch (error) {
     console.error('Data transform error:', error);
+    const err = ensureError(error);
     return {
       ...data,
-      transform_error: error.message
+      transform_error: err.message
     };
   }
 }
 
-async function executeWebhookResponse(node: WorkflowNode, data: any): Promise<any> {
+async function executeWebhookResponse(node: WorkflowNode, data: Record<string, unknown>): Promise<unknown> {
   // Parse config if it's a string (which it often is)
   let config = node.data.config || {};
   if (typeof config === 'string') {
@@ -2124,7 +2271,7 @@ async function executeWebhookResponse(node: WorkflowNode, data: any): Promise<an
     }
   }
   
-  const { statusCode = 200, responseBody, headers = {} } = config;
+  const { statusCode = 200, responseBody, headers = {} } = (config as any);
   
   console.log(`📤 Webhook Response executed with status: ${statusCode}`);
   console.log(`📤 Raw response body from config:`, responseBody);
@@ -2158,7 +2305,7 @@ async function executeWebhookResponse(node: WorkflowNode, data: any): Promise<an
   console.log(`📤 Final processed response body:`, JSON.stringify(processedResponseBody).substring(0, 200) + '...');
   
   // Return only the configured response body, not accumulated workflow data
-  const result = {
+  const result: Record<string, unknown> = {
     webhook_response: {
       statusCode,
       body: processedResponseBody,
@@ -2173,7 +2320,7 @@ async function executeWebhookResponse(node: WorkflowNode, data: any): Promise<an
   return result;
 }
 
-async function executeRouter(node: WorkflowNode, data: any): Promise<any> {
+async function executeRouter(node: WorkflowNode, data: Record<string, unknown>): Promise<unknown> {
   console.log(`🔀 Router node executing with config:`, node.data.config);
   
   // Router node just passes data through - the parallel execution logic

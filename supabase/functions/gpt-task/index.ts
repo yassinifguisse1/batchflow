@@ -2,6 +2,10 @@ import "https://deno.land/x/xhr@0.1.0/mod.ts";
 // @ts-expect-error - Deno imports
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 
+
+const BUILD_ID = "gpt-task:2025-09-25T" + Date.now(); // unique each deploy
+console.log("== BUILD_ID:", BUILD_ID);
+
 // Add Deno type declaration for TypeScript
 interface DenoEnv {
   get(key: string): string | undefined;
