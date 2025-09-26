@@ -107,6 +107,11 @@ interface WorkflowResult {
   gptTaskCount?: number;
   totalParallelTasks?: number;
   parallelOptimized?: boolean;
+  details?: {
+    reason: string;
+    suggestion?: string;
+    timestamp: string;
+  };
 }
 
 interface WorkflowNode {
@@ -143,8 +148,8 @@ serve(async (req) => {
   
   try {
     // Initialize Supabase client
-    const supabaseUrl = Deno.env.get('VITE_SUPABASE_URL')!;
-    const supabaseServiceKey = Deno.env.get('VITE_SUPABASE_SERVICE_ROLE_KEY')!;
+    const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
+    const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
     const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
     // Extract webhook path from URL
@@ -406,12 +411,51 @@ serve(async (req) => {
               .eq('id', webhookRequestId);
           }
         } catch (workflowError) {
-          console.error('Workflow execution error:', workflowError);
+          const err = ensureError(workflowError);
+          
+          console.log('\n' + '='.repeat(80));
+          console.log('🚨 WEBHOOK WORKFLOW EXECUTION FAILED');
+          console.log('='.repeat(80));
+          console.log(`❌ Error: ${err.message}`);
+          
+          // Determine if this is an incomplete results error
+          const isIncompleteResults = err.message.includes('Incomplete workflow results') || 
+                                    err.message.includes('Missing GPT') ||
+                                    err.message.includes('Cannot send partial response');
+          
+          if (isIncompleteResults) {
+            console.log(`🔍 Error Type: Incomplete Results`);
+            console.log(`📝 Reason: Not all GPT tasks completed successfully`);
+            console.log(`🎯 Action: Returning error response to Make.com (no partial data)`);
+            console.log(`💡 Suggestion: Check GPT task configurations and retry`);
+            
           workflowResult = { 
-            message: 'Workflow execution failed', 
-            error: (workflowError as Error).message,
+              error: 'Workflow incomplete',
+              message: 'Not all required GPT results were generated. Workflow blocked to prevent partial data.',
+              details: {
+                reason: 'incomplete_gpt_results',
+                suggestion: 'Check GPT task configurations and retry the webhook',
+                timestamp: new Date().toISOString()
+              },
+              data: requestBody
+            };
+          } else {
+            console.log(`🔍 Error Type: System Error`);
+            console.log(`📝 Reason: ${err.message}`);
+            console.log(`🎯 Action: Returning generic error response`);
+            
+            workflowResult = { 
+              error: 'Workflow execution failed',
+              message: err.message,
+              details: {
+                reason: 'system_error',
+                timestamp: new Date().toISOString()
+              },
             data: requestBody 
           };
+          }
+          
+          console.log('='.repeat(80));
         }
       } else {
         console.log(`No matching trigger node found for webhook ${webhook.id} in any of the ${workflows.length} workflows`);
@@ -975,24 +1019,95 @@ async function processWorkflowWithEarlyResponse(
       }
     }
 
-    // Wait for ALL parallel tasks (HTTP + GPT) to complete
+    // Wait for ALL parallel tasks (HTTP + GPT) to complete with timeout protection
     console.log(`🚀 Waiting for ${allParallelTasks.length} parallel tasks to complete...`);
-    const allResults = await Promise.all(allParallelTasks);
     
-    // Process all results
+    // Add overall timeout for parallel execution (5 minutes)
+    const PARALLEL_TIMEOUT = 300000; // 5 minutes
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error(`Parallel tasks timed out after ${PARALLEL_TIMEOUT}ms`)), PARALLEL_TIMEOUT);
+    });
+    
+    let allResults;
+    try {
+      allResults = await Promise.race([
+        Promise.all(allParallelTasks),
+        timeoutPromise
+      ]);
+      console.log(`✅ All ${allParallelTasks.length} parallel tasks completed successfully`);
+    } catch (error) {
+      const err = ensureError(error);
+      if (err.message.includes('timed out')) {
+        console.error(`⏰ Parallel tasks timed out after ${PARALLEL_TIMEOUT}ms`);
+        // Mark execution as timed out but don't throw - return partial results
+        if (executionId) {
+          await supabase
+            .from('workflow_executions')
+            .update({
+              status: 'timeout',
+              error_message: err.message
+            })
+            .eq('id', executionId);
+        }
+        throw err;
+      }
+      throw err;
+    }
+    
+    // Helper function to extract proper node number from GPT nodes
+    const getGPTNodeNumber = (node: WorkflowNode): number => {
+      const nodeLabel = (node.data?.label as string) || (node.data?.config as any)?.label || '';
+      
+      // First, try to extract from label (e.g., "GPT 3" -> 3)
+      if (nodeLabel.trim()) {
+        const labelMatch = nodeLabel.trim().match(/(\d+)/);
+        if (labelMatch) {
+          return parseInt(labelMatch[1]);
+        }
+      }
+      
+      // If no number from label, use nodeNumber from data
+      if ((node as any).data?.nodeNumber) {
+        return (node as any).data.nodeNumber as number;
+      }
+      
+      // Try to extract from node ID as fallback
+      const idMatch = node.id.match(/(\d+)/);
+      if (idMatch) {
+        return parseInt(idMatch[1]);
+      }
+      
+      // Last fallback - find position in sorted GPT nodes
+      const allGptNodes = nodes
+        .filter((n: WorkflowNode) => n.type === 'gptTask')
+        .sort((a: WorkflowNode, b: WorkflowNode) => {
+          const aTime = (a.data as any)?.createdAt || a.id;
+          const bTime = (b.data as any)?.createdAt || b.id;
+          return aTime.localeCompare(bTime);
+        });
+      
+      const gptIndex = allGptNodes.findIndex((n: WorkflowNode) => n.id === node.id);
+      return gptIndex >= 0 ? gptIndex + 1 : 1;
+    };
+
+    // Process all results with proper node numbering
+    const failedTasks: string[] = [];
+    const successfulTasks: string[] = [];
+    
     for (const taskResult of allResults) {
       if (!taskResult) continue;
 
       const { nodeId, node, result, failed, taskType } = taskResult;
       
       if (failed) {
-        console.error(`❌ ${taskType} task ${nodeId} failed, stopping workflow`);
+        failedTasks.push(`${taskType} ${nodeId}`);
+        console.error(`❌ ${taskType} task ${nodeId} failed, but continuing with other tasks`);
         
+        // Don't stop execution, just log the failure
         if (executionId) {
           await supabase
             .from('workflow_executions')
             .update({
-              status: 'failed',
               error_details: {
                 failed_node_id: nodeId,
                 error_message: (result as any)?.error || `${taskType} task failed`
@@ -1001,16 +1116,18 @@ async function processWorkflowWithEarlyResponse(
             .eq('id', executionId);
         }
         
-        throw new Error(`${taskType} task ${nodeId} failed: ${(result as any)?.error}`);
+        continue; // Continue with other tasks instead of throwing
       }
 
-      // Store result with proper indexing
+      successfulTasks.push(`${taskType} ${nodeId}`);
+
+      // Store result with proper indexing based on actual node numbers
       if (result && typeof result === 'object') {
         const safeNodeResult = JSON.parse(JSON.stringify(result));
         const nodeLabel = (node.data?.label as string) || (node.data?.config as any)?.label || '';
         
         if (taskType === 'httpTask') {
-          // Get or increment the count for HTTP tasks
+          // For HTTP tasks, use sequential numbering (this is usually correct)
           const currentCount = nodeTypeCounts.get('httpTask') || 0;
           const nodeIndex = currentCount + 1;
           nodeTypeCounts.set('httpTask', nodeIndex);
@@ -1032,15 +1149,20 @@ async function processWorkflowWithEarlyResponse(
           
           console.log(`💾 Stored HTTP result as "HTTP ${nodeIndex}"`);
         } else if (taskType === 'gptTask') {
-          // Get or increment the count for GPT tasks
-          const currentCount = nodeTypeCounts.get('gptTask') || 0;
-          const nodeIndex = currentCount + 1;
-          nodeTypeCounts.set('gptTask', nodeIndex);
+          // For GPT tasks, use the ACTUAL node number from the workflow
+          const actualNodeNumber = getGPTNodeNumber(node);
           
-          // Store with multiple reference patterns
+          console.log(`🔍 GPT Node ${nodeId} Debug:`, {
+            nodeId,
+            nodeLabel: nodeLabel.trim(),
+            actualNodeNumber,
+            dataKeys: Object.keys((node as any).data || {})
+          });
+          
+          // Store with the CORRECT node number
           accumulatedWorkflowData[nodeId] = safeNodeResult;
-          accumulatedWorkflowData[`GPT ${nodeIndex}`] = safeNodeResult;
-          accumulatedWorkflowData[`GPT Task ${nodeIndex}`] = safeNodeResult;
+          accumulatedWorkflowData[`GPT ${actualNodeNumber}`] = safeNodeResult;
+          accumulatedWorkflowData[`GPT Task ${actualNodeNumber}`] = safeNodeResult;
           
           // Store under label if exists
           if (typeof nodeLabel === 'string' && nodeLabel.trim()) {
@@ -1052,8 +1174,11 @@ async function processWorkflowWithEarlyResponse(
             accumulatedWorkflowData['GPT'] = safeNodeResult;
           }
           
-          console.log(`💾 Stored GPT result as "GPT ${nodeIndex}" with result:`, 
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          // Update the count to track how many GPT tasks we've processed
+          const currentCount = nodeTypeCounts.get('gptTask') || 0;
+          nodeTypeCounts.set('gptTask', currentCount + 1);
+          
+          console.log(`💾 Stored GPT result as "GPT ${actualNodeNumber}" with result:`, 
             typeof (result as any).result === 'string' 
               ? (result as any).result.substring(0, 100) + '...'
               : (result as any).result
@@ -1062,12 +1187,201 @@ async function processWorkflowWithEarlyResponse(
       }
     }
 
-    console.log(`✅ Completed ALL parallel tasks. HTTP: ${nodeTypeCounts.get('httpTask') || 0}, GPT: ${nodeTypeCounts.get('gptTask') || 0}`);
-    console.log('🎯 All accumulated data keys before webhook response:', Object.keys(accumulatedWorkflowData));
+    // Log the results summary
+    // Enhanced logging and validation before webhook response
+    console.log('\n' + '='.repeat(80));
+    console.log('🔍 PARALLEL EXECUTION RESULTS SUMMARY');
+    console.log('='.repeat(80));
+    
+    console.log(`📊 Task Execution Results:`);
+    console.log(`   ✅ Successful tasks: ${successfulTasks.length}`);
+    console.log(`   ❌ Failed tasks: ${failedTasks.length}`);
+    console.log(`   📈 Success rate: ${Math.round((successfulTasks.length / allResults.length) * 100)}%`);
+    
+    if (successfulTasks.length > 0) {
+      console.log(`\n✅ SUCCESSFUL TASKS:`);
+      successfulTasks.forEach(task => console.log(`   ✓ ${task}`));
+    }
+    
+    if (failedTasks.length > 0) {
+      console.log(`\n❌ FAILED TASKS:`);
+      failedTasks.forEach(task => console.log(`   ✗ ${task}`));
+    }
+    
+    // Check if too many tasks failed
+    if (failedTasks.length > 0) {
+      const failureRate = failedTasks.length / allResults.length;
+      if (failureRate > 0.5) { // More than 50% failed
+        console.log(`\n🚨 CRITICAL FAILURE: Too many tasks failed (${Math.round(failureRate * 100)}%)`);
+        throw new Error(`Too many parallel tasks failed (${failedTasks.length}/${allResults.length}): ${failedTasks.join(', ')}`);
+      } else {
+        console.log(`\n⚠️ WARNING: Some tasks failed but continuing (${Math.round(failureRate * 100)}% failure rate)`);
+      }
+    }
+
+    // Detailed GPT results validation
+    console.log(`\n🧠 GPT RESULTS VALIDATION:`);
+    const expectedGPTCount = parallelGptGroups.reduce((total, group) => total + group.length, 0);
+    const actualGPTCount = nodeTypeCounts.get('gptTask') || 0;
+    
+    console.log(`   Expected GPT tasks: ${expectedGPTCount}`);
+    console.log(`   Completed GPT tasks: ${actualGPTCount}`);
+    console.log(`   Missing GPT tasks: ${expectedGPTCount - actualGPTCount}`);
+    
+    // Get the actual GPT nodes from the workflow and determine required GPT numbers
+    const actualGPTNodes = nodes.filter(node => node.type === 'gptTask');
+    const requiredGPTNumbers: number[] = [];
+    
+    // Extract the actual GPT numbers from the workflow nodes
+    actualGPTNodes.forEach(node => {
+      const nodeLabel = (node.data?.label as string) || (node.data?.config as any)?.label || '';
+      
+      // First, try to extract from label (e.g., "GPT 3" -> 3)
+      let nodeNumber = null as number | null;
+      if (nodeLabel.trim()) {
+        const labelMatch = nodeLabel.trim().match(/(\d+)/);
+        if (labelMatch) {
+          nodeNumber = parseInt(labelMatch[1]);
+        }
+      }
+      
+      // If no number from label, use nodeNumber from data
+      if (!nodeNumber && (node as any).data?.nodeNumber) {
+        nodeNumber = (node as any).data.nodeNumber as number;
+      }
+      
+      // Try to extract from node ID as fallback
+      if (!nodeNumber) {
+        const idMatch = node.id.match(/(\d+)/);
+        if (idMatch) {
+          nodeNumber = parseInt(idMatch[1]);
+        }
+      }
+      
+      // Last fallback - use sequential numbering
+      if (!nodeNumber) {
+        const gptIndex = actualGPTNodes.findIndex(n => n.id === node.id);
+        nodeNumber = gptIndex + 1;
+      }
+      
+      if (nodeNumber && !requiredGPTNumbers.includes(nodeNumber)) {
+        requiredGPTNumbers.push(nodeNumber);
+      }
+    });
+    
+    // Sort the required GPT numbers
+    requiredGPTNumbers.sort((a, b) => a - b);
+    
+    console.log(`   Required GPT numbers based on workflow: [${requiredGPTNumbers.join(', ')}]`);
+    
+    // Debug: Show all available keys in accumulated workflow data
+    const allGPTKeys = Object.keys(accumulatedWorkflowData).filter(key => key.startsWith('GPT'));
+    console.log(`   All GPT-related keys in workflow data: [${allGPTKeys.join(', ')}]`);
+    
+    // Debug: Show a sample of what's actually stored
+    console.log(`   Sample of accumulated workflow data keys: [${Object.keys(accumulatedWorkflowData).slice(0, 10).join(', ')}]`);
+    
+    const missingGPTResults: number[] = [];
+    const availableGPTResults: number[] = [];
+    
+    // Check each required GPT result
+    requiredGPTNumbers.forEach(num => {
+      const gptKey = `GPT ${num}`;
+      if (accumulatedWorkflowData[gptKey] && (accumulatedWorkflowData[gptKey] as any)?.result) {
+        availableGPTResults.push(num);
+        console.log(`   ✅ GPT ${num}: Available (${typeof (accumulatedWorkflowData[gptKey] as any).result === 'string' 
+          ? (accumulatedWorkflowData[gptKey] as any).result.substring(0, 50) + '...'
+          : 'Non-string result'})`);
+      } else {
+        missingGPTResults.push(num);
+        console.log(`   ❌ GPT ${num}: Missing or empty`);
+      }
+    });
+
+    console.log(`\n📋 GPT RESULTS STATUS:`);
+    console.log(`   ✅ Available: GPT ${availableGPTResults.join(', GPT ')}`);
+    if (missingGPTResults.length > 0) {
+      console.log(`   ❌ Missing: GPT ${missingGPTResults.join(', GPT ')}`);
+    }
+
+    // CRITICAL: Check if ALL required GPT results are available
+    const allGPTResultsAvailable = missingGPTResults.length === 0;
+    
+    console.log(`\n🎯 WEBHOOK RESPONSE VALIDATION:`);
+    console.log(`   All GPT results available: ${allGPTResultsAvailable ? '✅ YES' : '❌ NO'}`);
+    console.log(`   Missing results count: ${missingGPTResults.length}`);
+    
+    // Calculate success rate for more flexible handling
+    const gptSuccessRate = availableGPTResults.length / requiredGPTNumbers.length;
+    const minRequiredSuccessRate = 0.8; // Allow response if 80% of GPT tasks succeed
+    
+    console.log(`   GPT Success Rate: ${Math.round(gptSuccessRate * 100)}%`);
+    console.log(`   Minimum Required: ${Math.round(minRequiredSuccessRate * 100)}%`);
+    
+    if (!allGPTResultsAvailable) {
+      console.log(`\n⚠️ INCOMPLETE GPT RESULTS DETECTED:`);
+      console.log(`   Missing: GPT ${missingGPTResults.join(', GPT ')}`);
+      console.log(`   Available: GPT ${availableGPTResults.join(', GPT ')}`);
+      console.log(`   Success Rate: ${Math.round(gptSuccessRate * 100)}%`);
+      
+      // Check if we have enough successful results to proceed
+      if (gptSuccessRate >= minRequiredSuccessRate) {
+        console.log(`\n✅ ALLOWING PARTIAL RESPONSE:`);
+        console.log(`   Reason: Success rate (${Math.round(gptSuccessRate * 100)}%) meets minimum threshold`);
+        console.log(`   Action: Proceeding with available GPT results`);
+        console.log(`   Note: Missing GPT results will show as {{GPT X.result}} in response`);
+        
+        // Update execution status to indicate partial success
+        if (executionId) {
+          await supabase
+            .from('workflow_executions')
+            .update({
+              status: 'partial_success',
+              error_message: `Partial GPT results: Missing GPT ${missingGPTResults.join(', GPT ')} but proceeding`,
+              error_details: {
+                missing_gpt_results: missingGPTResults,
+                available_gpt_results: availableGPTResults,
+                success_rate: gptSuccessRate,
+                total_expected: requiredGPTNumbers.length,
+                total_completed: availableGPTResults.length
+              }
+            })
+            .eq('id', executionId);
+        }
+      } else {
+        console.log(`\n🚨 BLOCKING WEBHOOK RESPONSE:`);
+        console.log(`   Reason: Success rate (${Math.round(gptSuccessRate * 100)}%) below minimum threshold (${Math.round(minRequiredSuccessRate * 100)}%)`);
+        console.log(`   Missing: GPT ${missingGPTResults.join(', GPT ')}`);
+        console.log(`   Action: Throwing error to prevent incomplete response to Make.com`);
+        
+        // Update execution status to indicate incomplete results
+        if (executionId) {
+          await supabase
+            .from('workflow_executions')
+            .update({
+              status: 'incomplete',
+              error_message: `Incomplete GPT results: Missing GPT ${missingGPTResults.join(', GPT ')}`,
+              error_details: {
+                missing_gpt_results: missingGPTResults,
+                available_gpt_results: availableGPTResults,
+                success_rate: gptSuccessRate,
+                total_expected: requiredGPTNumbers.length,
+                total_completed: availableGPTResults.length
+              }
+            })
+            .eq('id', executionId);
+        }
+        
+        throw new Error(`Incomplete workflow results: Missing GPT ${missingGPTResults.join(', GPT ')}. Success rate ${Math.round(gptSuccessRate * 100)}% below required ${Math.round(minRequiredSuccessRate * 100)}%.`);
+      }
+    }
+
+    console.log(`\n✅ ALL VALIDATIONS PASSED - Proceeding with webhook response`);
+    console.log('='.repeat(80));
 
     // Now execute the webhook response node with ALL results (HTTP + GPT)
     console.log('🎯 Executing webhook response node with ALL parallel results');
-    console.log('🎯 Available data keys:', Object.keys(accumulatedWorkflowData));
+    console.log('🎯 Available data keys:', Object.keys(accumulatedWorkflowData).length);
     console.log('🎯 HTTP result keys:', Object.keys(accumulatedWorkflowData).filter(k => k.startsWith('HTTP')));
     console.log('🎯 GPT result keys:', Object.keys(accumulatedWorkflowData).filter(k => k.startsWith('GPT')));
 
@@ -1137,18 +1451,67 @@ async function processWorkflowWithEarlyResponse(
     };
 
   } catch (error) {
-    console.error('❌ Parallel HTTP workflow failed:', error);
     const err = ensureError(error);
     
+    console.log('\n' + '='.repeat(80));
+    console.log('🚨 WORKFLOW EXECUTION FAILED');
+    console.log('='.repeat(80));
+    console.log(`❌ Error Type: ${err.name || 'Unknown'}`);
+    console.log(`❌ Error Message: ${err.message}`);
+    
+    // Categorize the error for better handling
+    let errorCategory = 'unknown';
+    let shouldReturnError = true;
+    
+    if (err.message.includes('Incomplete workflow results') || err.message.includes('Missing GPT')) {
+      errorCategory = 'incomplete_results';
+      console.log(`🔍 Error Category: Incomplete Results`);
+      console.log(`📝 Reason: Some GPT tasks failed or didn't complete`);
+      console.log(`🎯 Action: Blocking response to prevent partial data to Make.com`);
+      shouldReturnError = true;
+    } else if (err.message.includes('timed out') || err.message.includes('timeout')) {
+      errorCategory = 'timeout';
+      console.log(`🔍 Error Category: Timeout`);
+      console.log(`📝 Reason: Tasks took too long to complete`);
+      console.log(`🎯 Action: Blocking response due to timeout`);
+      shouldReturnError = true;
+    } else if (err.message.includes('Too many parallel tasks failed')) {
+      errorCategory = 'multiple_failures';
+      console.log(`🔍 Error Category: Multiple Task Failures`);
+      console.log(`📝 Reason: More than 50% of tasks failed`);
+      console.log(`🎯 Action: Blocking response due to high failure rate`);
+      shouldReturnError = true;
+    } else {
+      errorCategory = 'system_error';
+      console.log(`🔍 Error Category: System Error`);
+      console.log(`📝 Reason: Unexpected system failure`);
+      console.log(`🎯 Action: Blocking response due to system error`);
+      shouldReturnError = true;
+    }
+    
+    // Update execution record with detailed error info
     if (executionId) {
+      console.log(`📝 Updating execution record ${executionId} with error details`);
       await supabase
         .from('workflow_executions')
         .update({
           status: 'failed',
-          error_message: err.message
+          error_message: err.message,
+          error_details: {
+            error_category: errorCategory,
+            error_type: err.name || 'Unknown',
+            timestamp: new Date().toISOString(),
+            should_return_error: shouldReturnError
+          },
+          completed_at: new Date().toISOString()
         })
         .eq('id', executionId);
     }
+    
+    console.log(`\n🚫 BLOCKING RESPONSE TO MAKE.COM`);
+    console.log(`   Reason: ${errorCategory}`);
+    console.log(`   Message: ${err.message}`);
+    console.log('='.repeat(80));
     
     throw err;
   }
@@ -1173,7 +1536,7 @@ function findParallelGptGroups(nodes: WorkflowNode[], edges: WorkflowEdge[], web
   return [];
 }
 
-// Helper function to execute a parallel task (HTTP or GPT)
+// Helper function to execute a parallel task (HTTP or GPT) with timeout and retry
 async function executeParallelTask(
   nodeId: string, 
   nodes: WorkflowNode[], 
@@ -1188,11 +1551,20 @@ async function executeParallelTask(
   result: unknown;
   failed?: boolean;
   taskType: 'httpTask' | 'gptTask';
+  retryCount?: number;
+  executionTime?: number;
 } | null> {
   const node = nodes.find((n: WorkflowNode) => n.id === nodeId);
   if (!node) return null;
 
-  console.log(`⚡ Starting parallel ${taskType} ${nodeId}`);
+  const startTime = Date.now();
+  const maxRetries = 2; // 2 retries for parallel tasks
+  const taskTimeout = taskType === 'gptTask' ? 120000 : 30000; // 2 min for GPT, 30 sec for HTTP
+  
+  let retryCount = 0;
+  let lastError: Error | null = null;
+
+  console.log(`⚡ Starting parallel ${taskType} ${nodeId} (timeout: ${taskTimeout}ms, retries: ${maxRetries})`);
   
   // Update execution tracking
   if (executionId) {
@@ -1207,7 +1579,10 @@ async function executeParallelTask(
 
   executedNodes.add(nodeId);
 
+  while (retryCount <= maxRetries) {
   try {
+      console.log(`⚡ ${taskType} ${nodeId} attempt ${retryCount + 1}/${maxRetries + 1} (timeout: ${taskTimeout}ms)`);
+      
     // Resolve node configuration with parameter replacement
     const resolvedNode = {
       ...node,
@@ -1217,27 +1592,54 @@ async function executeParallelTask(
       }
     };
 
-    // Execute task
-    const nodeResult = await executeNode(resolvedNode, accumulatedWorkflowData, supabase);
-    
-    console.log(`✅ Parallel ${taskType} ${nodeId} completed`);
+      // Create timeout promise
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        setTimeout(() => reject(new Error(`${taskType} ${nodeId} timed out after ${taskTimeout}ms`)), taskTimeout);
+      });
+
+      // Execute task with timeout
+      const taskPromise = executeNode(resolvedNode, accumulatedWorkflowData, supabase);
+      const nodeResult = await Promise.race([taskPromise, timeoutPromise]);
+      
+      const executionTime = Date.now() - startTime;
+      console.log(`✅ Parallel ${taskType} ${nodeId} completed in ${executionTime}ms (attempt ${retryCount + 1})`);
+      
     return {
       nodeId,
       node,
       result: nodeResult,
-      taskType
+        taskType,
+        retryCount,
+        executionTime
     };
+      
   } catch (error) {
-    const err = ensureError(error);
-    console.error(`❌ Parallel ${taskType} ${nodeId} failed:`, error);
+      lastError = ensureError(error);
+      retryCount++;
+      
+      console.error(`❌ Parallel ${taskType} ${nodeId} attempt ${retryCount} failed:`, lastError.message);
+      
+      if (retryCount <= maxRetries) {
+        // Exponential backoff: 1s, 2s, 4s
+        const delay = Math.min(1000 * Math.pow(2, retryCount - 1), 5000);
+        console.log(`⏳ Retrying ${taskType} ${nodeId} in ${delay}ms...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+  }
+
+  const executionTime = Date.now() - startTime;
+  console.error(`❌ Parallel ${taskType} ${nodeId} failed after ${maxRetries + 1} attempts in ${executionTime}ms`);
+  
     return {
       nodeId,
       node,
-      result: { error: err.message },
+    result: { error: lastError?.message || `${taskType} failed after all retries` },
       failed: true,
-      taskType
+    taskType,
+    retryCount,
+    executionTime
     };
-  }
 }
 
 // Helper function to find parallel HTTP task groups  
