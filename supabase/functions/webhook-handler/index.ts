@@ -1,7 +1,12 @@
 import "https://deno.land/x/xhr@0.1.0/mod.ts";
+// @ts-expect-error - Deno imports
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+// @ts-expect-error - Deno imports
+
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.53.0';
+// @ts-expect-error - Deno imports
+
 import type { SupabaseClient as SupabaseClientGeneric } from 'https://esm.sh/@supabase/supabase-js@2.53.0';
 
 // Add Deno type declaration for TypeScript
@@ -148,8 +153,8 @@ serve(async (req) => {
   
   try {
     // Initialize Supabase client
-    const supabaseUrl = Deno.env.get('VITE_SUPABASE_URL')!;
-    const supabaseServiceKey = Deno.env.get('VITE_SUPABASE_PUBLISHABLE_KEY')!;
+    const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
+    const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
     const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
     // Extract webhook path from URL
@@ -1054,63 +1059,102 @@ async function processWorkflowWithEarlyResponse(
       throw err;
     }
     
-    // Helper function to extract proper node number from GPT nodes
-    const getGPTNodeNumber = (node: WorkflowNode): number => {
+    // ENHANCED: Helper function to extract proper node number from GPT nodes with better fallback logic
+    const getGPTNodeNumber = (node: WorkflowNode, allGptNodes: WorkflowNode[]): number => {
       const nodeLabel = (node.data?.label as string) || (node.data?.config as any)?.label || '';
+      let nodeNumber: number | null = null;
       
-      // First, try to extract from label (e.g., "GPT 3" -> 3)
+      console.log(`🔍 Analyzing GPT node ${node.id} for number extraction:`, {
+        nodeId: node.id,
+        nodeLabel: nodeLabel.trim(),
+        hasNodeNumber: !!(node.data as any)?.nodeNumber,
+        nodeNumberValue: (node.data as any)?.nodeNumber
+      });
+      
+      // PRIORITY 1: Extract from node label (most reliable)
       if (nodeLabel.trim()) {
         const labelMatch = nodeLabel.trim().match(/(\d+)/);
         if (labelMatch) {
-          return parseInt(labelMatch[1]);
+          nodeNumber = parseInt(labelMatch[1]);
+          console.log(`✅ Found number ${nodeNumber} from label: "${nodeLabel.trim()}"`);
         }
       }
       
-      // If no number from label, use nodeNumber from data
-      if ((node as any).data?.nodeNumber) {
-        return (node as any).data.nodeNumber as number;
+      // PRIORITY 2: Use stored nodeNumber from data
+      if (!nodeNumber && (node.data as any)?.nodeNumber) {
+        nodeNumber = (node.data as any).nodeNumber as number;
+        console.log(`✅ Found number ${nodeNumber} from node.data.nodeNumber`);
       }
       
-      // Try to extract from node ID as fallback
-      const idMatch = node.id.match(/(\d+)/);
-      if (idMatch) {
-        return parseInt(idMatch[1]);
+      // PRIORITY 3: Extract from node ID
+      if (!nodeNumber) {
+        const idMatch = node.id.match(/(\d+)/);
+        if (idMatch) {
+          nodeNumber = parseInt(idMatch[1]);
+          console.log(`✅ Found number ${nodeNumber} from node ID: ${node.id}`);
+        }
       }
       
-      // Last fallback - find position in sorted GPT nodes
-      const allGptNodes = nodes
-        .filter((n: WorkflowNode) => n.type === 'gptTask')
-        .sort((a: WorkflowNode, b: WorkflowNode) => {
-          const aTime = (a.data as any)?.createdAt || a.id;
-          const bTime = (b.data as any)?.createdAt || b.id;
-          return aTime.localeCompare(bTime);
-        });
+      // PRIORITY 4: Use position in sorted GPT nodes array (deterministic fallback)
+      if (!nodeNumber) {
+        const gptIndex = allGptNodes.findIndex((n: WorkflowNode) => n.id === node.id);
+        nodeNumber = gptIndex >= 0 ? gptIndex + 1 : 1;
+        console.log(`✅ Using fallback position-based number ${nodeNumber} (index ${gptIndex})`);
+      }
       
-      const gptIndex = allGptNodes.findIndex((n: WorkflowNode) => n.id === node.id);
-      return gptIndex >= 0 ? gptIndex + 1 : 1;
+      console.log(`🎯 Final GPT node number for ${node.id}: ${nodeNumber}`);
+      return nodeNumber;
     };
 
-    // Process all results with proper node numbering
+    // ENHANCED: Process all results with proper node numbering and retry logic
     const failedTasks: string[] = [];
     const successfulTasks: string[] = [];
+    const retryableTasks: string[] = [];
+    
+    // Get all GPT nodes for consistent numbering
+    const allGptNodes = nodes
+      .filter((n: WorkflowNode) => n.type === 'gptTask')
+      .sort((a: WorkflowNode, b: WorkflowNode) => {
+        // Sort by creation time or ID for consistent ordering
+        const aTime = (a.data as any)?.createdAt || a.id;
+        const bTime = (b.data as any)?.createdAt || b.id;
+        return aTime.localeCompare(bTime);
+      });
+    
+    console.log(`🧠 Found ${allGptNodes.length} total GPT nodes in workflow:`, 
+      allGptNodes.map(n => ({ id: n.id, label: (n.data?.label as string) || 'No label' }))
+    );
     
     for (const taskResult of allResults) {
       if (!taskResult) continue;
 
-      const { nodeId, node, result, failed, taskType } = taskResult;
+      const { nodeId, node, result, failed, taskType, retryCount } = taskResult;
       
       if (failed) {
         failedTasks.push(`${taskType} ${nodeId}`);
-        console.error(`❌ ${taskType} task ${nodeId} failed, but continuing with other tasks`);
+        console.error(`❌ ${taskType} task ${nodeId} failed after ${(retryCount || 0) + 1} attempts`);
         
-        // Don't stop execution, just log the failure
+        // Check if this is a retryable failure (not a timeout or configuration error)
+        const errorMessage = (result as any)?.error || `${taskType} task failed`;
+        const isRetryable = !errorMessage.includes('timeout') && 
+                           !errorMessage.includes('configuration') && 
+                           !errorMessage.includes('invalid');
+        
+        if (isRetryable && taskType === 'gptTask') {
+          retryableTasks.push(nodeId);
+          console.log(`🔄 GPT task ${nodeId} marked for potential retry`);
+        }
+        
+        // Log the failure but don't stop execution
         if (executionId) {
           await supabase
             .from('workflow_executions')
             .update({
               error_details: {
                 failed_node_id: nodeId,
-                error_message: (result as any)?.error || `${taskType} task failed`
+                error_message: errorMessage,
+                retry_count: retryCount || 0,
+                is_retryable: isRetryable
               }
             })
             .eq('id', executionId);
@@ -1126,8 +1170,19 @@ async function processWorkflowWithEarlyResponse(
         const safeNodeResult = JSON.parse(JSON.stringify(result));
         const nodeLabel = (node.data?.label as string) || (node.data?.config as any)?.label || '';
         
+        // Validate that the result has actual content
+        const hasValidContent = (safeNodeResult as any).result && 
+                               (safeNodeResult as any).result !== '' && 
+                               ((safeNodeResult as any).result.trim?.() || '').length > 0;
+        
+        if (!hasValidContent) {
+          console.warn(`⚠️ ${taskType} ${nodeId} completed but has empty result content`);
+          failedTasks.push(`${taskType} ${nodeId} (empty result)`);
+          continue;
+        }
+        
         if (taskType === 'httpTask') {
-          // For HTTP tasks, use sequential numbering (this is usually correct)
+          // For HTTP tasks, use sequential numbering
           const currentCount = nodeTypeCounts.get('httpTask') || 0;
           const nodeIndex = currentCount + 1;
           nodeTypeCounts.set('httpTask', nodeIndex);
@@ -1149,20 +1204,22 @@ async function processWorkflowWithEarlyResponse(
           
           console.log(`💾 Stored HTTP result as "HTTP ${nodeIndex}"`);
         } else if (taskType === 'gptTask') {
-          // For GPT tasks, use the ACTUAL node number from the workflow
-          const actualNodeNumber = getGPTNodeNumber(node);
+          // ENHANCED: For GPT tasks, use the ACTUAL node number from the workflow
+          const actualNodeNumber = getGPTNodeNumber(node, allGptNodes);
           
-          console.log(`🔍 GPT Node ${nodeId} Debug:`, {
+          console.log(`🔍 GPT Node ${nodeId} Processing:`, {
             nodeId,
             nodeLabel: nodeLabel.trim(),
             actualNodeNumber,
-            dataKeys: Object.keys((node as any).data || {})
+            resultLength: typeof (safeNodeResult as any).result === 'string' ? (safeNodeResult as any).result.length : 'N/A',
+            hasValidResult: hasValidContent
           });
           
-          // Store with the CORRECT node number
+          // Store with the CORRECT node number and MULTIPLE reference patterns
           accumulatedWorkflowData[nodeId] = safeNodeResult;
           accumulatedWorkflowData[`GPT ${actualNodeNumber}`] = safeNodeResult;
           accumulatedWorkflowData[`GPT Task ${actualNodeNumber}`] = safeNodeResult;
+          accumulatedWorkflowData[`GPT${actualNodeNumber}`] = safeNodeResult; // No space variant
           
           // Store under label if exists
           if (typeof nodeLabel === 'string' && nodeLabel.trim()) {
@@ -1178,19 +1235,79 @@ async function processWorkflowWithEarlyResponse(
           const currentCount = nodeTypeCounts.get('gptTask') || 0;
           nodeTypeCounts.set('gptTask', currentCount + 1);
           
-          console.log(`💾 Stored GPT result as "GPT ${actualNodeNumber}" with result:`, 
-            typeof (result as any).result === 'string' 
-              ? (result as any).result.substring(0, 100) + '...'
-              : (result as any).result
+          console.log(`💾 Stored GPT result as "GPT ${actualNodeNumber}" with content:`, 
+            typeof (safeNodeResult as any).result === 'string' 
+              ? `"${(safeNodeResult as any).result.substring(0, 50)}..." (${(safeNodeResult as any).result.length} chars)`
+              : `Non-string result: ${typeof (safeNodeResult as any).result}`
           );
         }
+      } else {
+        console.warn(`⚠️ ${taskType} ${nodeId} has invalid result structure:`, result);
+        failedTasks.push(`${taskType} ${nodeId} (invalid structure)`);
+      }
+    }
+
+    // ENHANCED: Automatic retry logic for failed GPT tasks
+    if (retryableTasks.length > 0 && failedTasks.length > 0) {
+      console.log(`\n🔄 AUTOMATIC RETRY: Attempting to retry ${retryableTasks.length} failed GPT tasks...`);
+      
+      const retryPromises: Promise<any>[] = [];
+      
+      for (const nodeId of retryableTasks) {
+        const retryTask = executeParallelTask(nodeId, nodes, accumulatedWorkflowData, executedNodes, executionId, supabase, 'gptTask');
+        retryPromises.push(retryTask);
+      }
+      
+      try {
+        const retryResults = await Promise.allSettled(retryPromises);
+        
+        for (let i = 0; i < retryResults.length; i++) {
+          const retryResult = retryResults[i];
+          const nodeId = retryableTasks[i];
+          
+          if (retryResult.status === 'fulfilled' && retryResult.value && !retryResult.value.failed) {
+            const { node, result } = retryResult.value;
+            const safeNodeResult = JSON.parse(JSON.stringify(result));
+            
+            // Validate retry result has content
+            const hasValidContent = (safeNodeResult as any).result && 
+                                   (safeNodeResult as any).result !== '' && 
+                                   ((safeNodeResult as any).result.trim?.() || '').length > 0;
+            
+            if (hasValidContent) {
+              // Store the retry result
+              const actualNodeNumber = getGPTNodeNumber(node, allGptNodes);
+              accumulatedWorkflowData[nodeId] = safeNodeResult;
+              accumulatedWorkflowData[`GPT ${actualNodeNumber}`] = safeNodeResult;
+              accumulatedWorkflowData[`GPT Task ${actualNodeNumber}`] = safeNodeResult;
+              accumulatedWorkflowData[`GPT${actualNodeNumber}`] = safeNodeResult;
+              
+              // Remove from failed tasks and add to successful
+              const failedIndex = failedTasks.findIndex(task => task.includes(nodeId));
+              if (failedIndex >= 0) {
+                failedTasks.splice(failedIndex, 1);
+                successfulTasks.push(`gptTask ${nodeId} (retry success)`);
+              }
+              
+              console.log(`✅ RETRY SUCCESS: GPT ${actualNodeNumber} (${nodeId}) completed on retry`);
+            } else {
+              console.log(`❌ RETRY FAILED: GPT task ${nodeId} retry completed but still has empty content`);
+            }
+          } else {
+            console.log(`❌ RETRY FAILED: GPT task ${nodeId} retry failed:`, 
+              retryResult.status === 'fulfilled' ? retryResult.value?.result : retryResult.reason
+            );
+          }
+        }
+      } catch (retryError) {
+        console.error(`❌ Error during GPT task retries:`, retryError);
       }
     }
 
     // Log the results summary
     // Enhanced logging and validation before webhook response
     console.log('\n' + '='.repeat(80));
-    console.log('🔍 PARALLEL EXECUTION RESULTS SUMMARY');
+    console.log('🔍 PARALLEL EXECUTION RESULTS SUMMARY (After Retries)');
     console.log('='.repeat(80));
     
     console.log(`📊 Task Execution Results:`);
@@ -1228,44 +1345,19 @@ async function processWorkflowWithEarlyResponse(
     console.log(`   Completed GPT tasks: ${actualGPTCount}`);
     console.log(`   Missing GPT tasks: ${expectedGPTCount - actualGPTCount}`);
     
-    // Get the actual GPT nodes from the workflow and determine required GPT numbers
-    const actualGPTNodes = nodes.filter(node => node.type === 'gptTask');
+    // ENHANCED: Get the actual GPT nodes and determine required GPT numbers using consistent logic
+    const actualGPTNodes = allGptNodes; // Use the same sorted list we used for processing
     const requiredGPTNumbers: number[] = [];
     
-    // Extract the actual GPT numbers from the workflow nodes
+    console.log(`🧠 Determining required GPT numbers from ${actualGPTNodes.length} GPT nodes...`);
+    
+    // Extract the actual GPT numbers from the workflow nodes using the same logic
     actualGPTNodes.forEach(node => {
-      const nodeLabel = (node.data?.label as string) || (node.data?.config as any)?.label || '';
-      
-      // First, try to extract from label (e.g., "GPT 3" -> 3)
-      let nodeNumber = null as number | null;
-      if (nodeLabel.trim()) {
-        const labelMatch = nodeLabel.trim().match(/(\d+)/);
-        if (labelMatch) {
-          nodeNumber = parseInt(labelMatch[1]);
-        }
-      }
-      
-      // If no number from label, use nodeNumber from data
-      if (!nodeNumber && (node as any).data?.nodeNumber) {
-        nodeNumber = (node as any).data.nodeNumber as number;
-      }
-      
-      // Try to extract from node ID as fallback
-      if (!nodeNumber) {
-        const idMatch = node.id.match(/(\d+)/);
-        if (idMatch) {
-          nodeNumber = parseInt(idMatch[1]);
-        }
-      }
-      
-      // Last fallback - use sequential numbering
-      if (!nodeNumber) {
-        const gptIndex = actualGPTNodes.findIndex(n => n.id === node.id);
-        nodeNumber = gptIndex + 1;
-      }
+      const nodeNumber = getGPTNodeNumber(node, allGptNodes);
       
       if (nodeNumber && !requiredGPTNumbers.includes(nodeNumber)) {
         requiredGPTNumbers.push(nodeNumber);
+        console.log(`📝 Required GPT ${nodeNumber} from node ${node.id}`);
       }
     });
     
@@ -1278,23 +1370,53 @@ async function processWorkflowWithEarlyResponse(
     const allGPTKeys = Object.keys(accumulatedWorkflowData).filter(key => key.startsWith('GPT'));
     console.log(`   All GPT-related keys in workflow data: [${allGPTKeys.join(', ')}]`);
     
+    // Debug: Show detailed content of each GPT key
+    allGPTKeys.forEach(key => {
+      const gptData = accumulatedWorkflowData[key];
+      const result = (gptData as any)?.result;
+      console.log(`   🔍 ${key}: ${result ? `"${String(result).substring(0, 30)}..." (${String(result).length} chars)` : 'MISSING/EMPTY'}`);
+    });
+    
     // Debug: Show a sample of what's actually stored
-    console.log(`   Sample of accumulated workflow data keys: [${Object.keys(accumulatedWorkflowData).slice(0, 10).join(', ')}]`);
+    console.log(`   Sample of accumulated workflow data keys: [${Object.keys(accumulatedWorkflowData).slice(0, 15).join(', ')}]`);
     
     const missingGPTResults: number[] = [];
     const availableGPTResults: number[] = [];
     
-    // Check each required GPT result
+    // Check each required GPT result - STRICT validation
     requiredGPTNumbers.forEach(num => {
       const gptKey = `GPT ${num}`;
-      if (accumulatedWorkflowData[gptKey] && (accumulatedWorkflowData[gptKey] as any)?.result) {
+      const gptData = accumulatedWorkflowData[gptKey];
+      const gptResult = (gptData as Record<string, unknown>)?.result;
+      
+      // STRICT: Must have data, result property, and non-empty content
+      const isValidResult = gptData && 
+                           gptResult !== undefined && 
+                           gptResult !== null && 
+                           gptResult !== '' && 
+                           (typeof gptResult === 'string' ? gptResult.trim().length > 0 : true) && 
+                           gptResult !== undefined && 
+                           gptResult !== null;
+      
+      if (isValidResult) {
         availableGPTResults.push(num);
-        console.log(`   ✅ GPT ${num}: Available (${typeof (accumulatedWorkflowData[gptKey] as any).result === 'string' 
-          ? (accumulatedWorkflowData[gptKey] as any).result.substring(0, 50) + '...'
+        console.log(`   ✅ GPT ${num}: Available (${typeof gptResult === 'string' 
+          ? gptResult.substring(0, 50) + '...'
           : 'Non-string result'})`);
       } else {
         missingGPTResults.push(num);
-        console.log(`   ❌ GPT ${num}: Missing or empty`);
+        console.log(`   ❌ GPT ${num}: Missing, empty, or invalid (result: ${gptResult})`);
+        
+        // Debug: Show what we actually have
+        if (gptData) {
+          console.log(`       Debug - GPT ${num} data:`, {
+            hasData: !!gptData,
+            hasResult: gptResult !== undefined,
+            resultType: typeof gptResult,
+            resultValue: gptResult,
+            resultLength: typeof gptResult === 'string' ? gptResult.length : 'N/A'
+          });
+        }
       }
     });
 
@@ -1311,69 +1433,41 @@ async function processWorkflowWithEarlyResponse(
     console.log(`   All GPT results available: ${allGPTResultsAvailable ? '✅ YES' : '❌ NO'}`);
     console.log(`   Missing results count: ${missingGPTResults.length}`);
     
-    // Calculate success rate for more flexible handling
+    // STRICT ALL-OR-NOTHING VALIDATION: Block ANY incomplete results
     const gptSuccessRate = availableGPTResults.length / requiredGPTNumbers.length;
-    const minRequiredSuccessRate = 0.8; // Allow response if 80% of GPT tasks succeed
     
     console.log(`   GPT Success Rate: ${Math.round(gptSuccessRate * 100)}%`);
-    console.log(`   Minimum Required: ${Math.round(minRequiredSuccessRate * 100)}%`);
+    console.log(`   Required: 100% (ALL GPT results must be present and valid)`);
     
     if (!allGPTResultsAvailable) {
-      console.log(`\n⚠️ INCOMPLETE GPT RESULTS DETECTED:`);
-      console.log(`   Missing: GPT ${missingGPTResults.join(', GPT ')}`);
+      console.log(`\n🚨 BLOCKING WEBHOOK RESPONSE - INCOMPLETE RESULTS:`);
+      console.log(`   Missing/Invalid: GPT ${missingGPTResults.join(', GPT ')}`);
       console.log(`   Available: GPT ${availableGPTResults.join(', GPT ')}`);
       console.log(`   Success Rate: ${Math.round(gptSuccessRate * 100)}%`);
+      console.log(`   Reason: ALL GPT results must be present and contain valid content`);
+      console.log(`   Action: Blocking response to prevent partial/invalid data to Make.com`);
+      console.log(`   Note: Empty strings, null, or undefined results are considered invalid`);
       
-      // Check if we have enough successful results to proceed
-      if (gptSuccessRate >= minRequiredSuccessRate) {
-        console.log(`\n✅ ALLOWING PARTIAL RESPONSE:`);
-        console.log(`   Reason: Success rate (${Math.round(gptSuccessRate * 100)}%) meets minimum threshold`);
-        console.log(`   Action: Proceeding with available GPT results`);
-        console.log(`   Note: Missing GPT results will show as {{GPT X.result}} in response`);
-        
-        // Update execution status to indicate partial success
-        if (executionId) {
-          await supabase
-            .from('workflow_executions')
-            .update({
-              status: 'partial_success',
-              error_message: `Partial GPT results: Missing GPT ${missingGPTResults.join(', GPT ')} but proceeding`,
-              error_details: {
-                missing_gpt_results: missingGPTResults,
-                available_gpt_results: availableGPTResults,
-                success_rate: gptSuccessRate,
-                total_expected: requiredGPTNumbers.length,
-                total_completed: availableGPTResults.length
-              }
-            })
-            .eq('id', executionId);
-        }
-      } else {
-        console.log(`\n🚨 BLOCKING WEBHOOK RESPONSE:`);
-        console.log(`   Reason: Success rate (${Math.round(gptSuccessRate * 100)}%) below minimum threshold (${Math.round(minRequiredSuccessRate * 100)}%)`);
-        console.log(`   Missing: GPT ${missingGPTResults.join(', GPT ')}`);
-        console.log(`   Action: Throwing error to prevent incomplete response to Make.com`);
-        
-        // Update execution status to indicate incomplete results
-        if (executionId) {
-          await supabase
-            .from('workflow_executions')
-            .update({
-              status: 'incomplete',
-              error_message: `Incomplete GPT results: Missing GPT ${missingGPTResults.join(', GPT ')}`,
-              error_details: {
-                missing_gpt_results: missingGPTResults,
-                available_gpt_results: availableGPTResults,
-                success_rate: gptSuccessRate,
-                total_expected: requiredGPTNumbers.length,
-                total_completed: availableGPTResults.length
-              }
-            })
-            .eq('id', executionId);
-        }
-        
-        throw new Error(`Incomplete workflow results: Missing GPT ${missingGPTResults.join(', GPT ')}. Success rate ${Math.round(gptSuccessRate * 100)}% below required ${Math.round(minRequiredSuccessRate * 100)}%.`);
+      // Update execution status to indicate incomplete results
+      if (executionId) {
+        await supabase
+          .from('workflow_executions')
+          .update({
+            status: 'incomplete',
+            error_message: `Incomplete GPT results: Missing or invalid GPT ${missingGPTResults.join(', GPT ')}`,
+            error_details: {
+              missing_gpt_results: missingGPTResults,
+              available_gpt_results: availableGPTResults,
+              success_rate: gptSuccessRate,
+              total_expected: requiredGPTNumbers.length,
+              total_completed: availableGPTResults.length,
+              validation_mode: 'strict_all_or_nothing'
+            }
+          })
+          .eq('id', executionId);
       }
+      
+      throw new Error(`Incomplete workflow results: Missing or invalid GPT ${missingGPTResults.join(', GPT ')}. ALL GPT results must be present and contain valid content. No partial responses allowed.`);
     }
 
     console.log(`\n✅ ALL VALIDATIONS PASSED - Proceeding with webhook response`);
@@ -1409,7 +1503,7 @@ async function processWorkflowWithEarlyResponse(
 
     const webhookResult = await executeNode(resolvedWebhookNode as WorkflowNode, accumulatedWorkflowData, supabase);
     
-    if ((webhookResult as any)?.webhook_response) {
+    if ((webhookResult as Record<string, unknown>)?.webhook_response) {
       webhookResponseResult = (webhookResult as any).webhook_response;
       console.log('🎯 WEBHOOK RESPONSE with all HTTP results:', webhookResponseResult);
     }
@@ -1558,8 +1652,8 @@ async function executeParallelTask(
   if (!node) return null;
 
   const startTime = Date.now();
-  const maxRetries = 2; // 2 retries for parallel tasks
-  const taskTimeout = taskType === 'gptTask' ? 120000 : 30000; // 2 min for GPT, 30 sec for HTTP
+  const maxRetries = taskType === 'gptTask' ? 3 : 2; // 3 retries for GPT, 2 for HTTP
+  const taskTimeout = taskType === 'gptTask' ? 150000 : 30000; // 2.5 min for GPT, 30 sec for HTTP
   
   let retryCount = 0;
   let lastError: Error | null = null;
@@ -1968,7 +2062,7 @@ async function processWorkflow(
     let currentNodes = [triggerNode.id];
     
     while (currentNodes.length > 0) {
-      const nodesToExecute = [];
+      const nodesToExecute: WorkflowNode[] = [];
       
       // Collect all nodes to execute in this batch
       for (const nodeId of currentNodes) {
@@ -2136,7 +2230,7 @@ async function processWorkflow(
           // For GPT nodes, store with deterministic keys based on node configuration
           if (nodeType === 'gptTask') {
             // Extract number from node label (e.g., "GPT 3" -> 3) as the primary source
-            let nodeNumber = null;
+            let nodeNumber = null as number | null;
             
             // First, try to extract from label - be more flexible with parsing
             if (nodeLabel.trim()) {
@@ -2584,14 +2678,14 @@ async function executeHTTPTask(node: WorkflowNode, data: Record<string, unknown>
     // Return the result with proper structure for reference by other nodes
     return {
       ...data,
-      response: (result as any).body,  // This is what {{HTTP 1.response}} should reference
-      http_response: (result as any).body,
-      http_status: (result as any).status,
-      http_success: (result as any).success,
-      request_url: (resolvedConfig as any).url,
-      request_method: (resolvedConfig as any).method,
-      request_body: (resolvedConfig as any).body,
-      request_headers: (resolvedConfig as any).headers,
+      response: (result as Record<string, unknown>).body,  // This is what {{HTTP 1.response}} should reference
+      http_response: (result as Record<string, unknown>).body,
+      http_status: (result as Record<string, unknown>).status,
+      http_success: (result as Record<string, unknown>).success,
+      request_url: (resolvedConfig as Record<string, unknown>).url,
+      request_method: (resolvedConfig as Record<string, unknown>).method,
+      request_body: (resolvedConfig as Record<string, unknown>).body,
+      request_headers: (resolvedConfig as Record<string, unknown>).headers,
       full_result: result // Store the complete result for debugging
     };
 
@@ -2609,11 +2703,11 @@ async function executeHTTPTask(node: WorkflowNode, data: Record<string, unknown>
 
 async function executeConditional(node: WorkflowNode, data: Record<string, unknown>): Promise<unknown> {
   // Simple conditional logic - could be expanded
-  const { condition, trueValue, falseValue } = (node.data.config as any) || {};
+  const { condition, trueValue, falseValue } = (node.data.config as Record<string, unknown>) || {};
   
   // Basic condition evaluation (you could make this more sophisticated)
   let conditionResult = false;
-  if (condition && typeof data === 'object') {
+  if (condition && typeof data === 'object' && typeof condition === 'string') {
     // Simple key existence check
     conditionResult = Object.keys(data).some(key => condition.includes(key));
   }
@@ -2627,7 +2721,7 @@ async function executeConditional(node: WorkflowNode, data: Record<string, unkno
 
 async function executeDataTransform(node: WorkflowNode, data: Record<string, unknown>): Promise<unknown> {
   try {
-    const { transformations } = (node.data.config as any) || {};
+    const { transformations } = (node.data.config as Record<string, unknown>) || {};
     const transformedData = { ...data };
 
     if (transformations && Array.isArray(transformations)) {
@@ -2674,7 +2768,7 @@ async function executeWebhookResponse(node: WorkflowNode, data: Record<string, u
     }
   }
   
-  const { statusCode = 200, responseBody, headers = {} } = (config as any);
+  const { statusCode = 200, responseBody, headers = {} } = (config as Record<string, unknown>);
   
   console.log(`📤 Webhook Response executed with status: ${statusCode}`);
   console.log(`📤 Raw response body from config:`, responseBody);
@@ -2694,15 +2788,15 @@ async function executeWebhookResponse(node: WorkflowNode, data: Record<string, u
     try {
       bodyAsObject = JSON.parse(processedResponseBody);
       // If successful, process the object and then convert back to JSON
-      processedResponseBody = replaceParameters(bodyAsObject, data);
+      processedResponseBody = replaceParameters(bodyAsObject, data) as Record<string, unknown>;
     } catch (error) {
       // If not valid JSON, process as string directly
       console.log('Response body is not valid JSON, processing as string');
-      processedResponseBody = replaceParameters(processedResponseBody, data);
+      processedResponseBody = replaceParameters(processedResponseBody, data) as Record<string, unknown>;
     }
   } else if (typeof processedResponseBody === 'object') {
     // If it's already an object, process it for parameter replacement
-    processedResponseBody = replaceParameters(processedResponseBody, data);
+    processedResponseBody = replaceParameters(processedResponseBody, data) as Record<string, unknown>;
   }
   
   console.log(`📤 Final processed response body:`, JSON.stringify(processedResponseBody).substring(0, 200) + '...');
