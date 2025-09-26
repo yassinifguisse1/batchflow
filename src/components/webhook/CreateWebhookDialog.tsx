@@ -111,7 +111,7 @@ const CreateWebhookDialog: React.FC<CreateWebhookDialogProps> = ({
       }
 
       // Generate the full webhook URL
-      const webhookUrl = `${import.meta.env.SUPABASE_URL}/functions/v1/webhook-handler/${urlPath}`;
+      const webhookUrl = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/webhook-handler/${urlPath}`;
 
       toast({
         title: "Webhook created successfully!",
