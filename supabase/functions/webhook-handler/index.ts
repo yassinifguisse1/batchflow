@@ -138,6 +138,105 @@ interface WorkflowEdge {
   target: string;
 }
 
+// SINGLE SOURCE OF TRUTH: GPT Node Numbering System
+interface GPTNodeMapping {
+  nodeId: string;
+  gptNumber: number;
+  label: string;
+  originalIndex: number;
+}
+
+class GPTNumberingManager {
+  private nodeMapping: Map<string, number> = new Map();
+  private reverseMapping: Map<number, string> = new Map();
+  private allMappings: GPTNodeMapping[] = [];
+
+  constructor(gptNodes: WorkflowNode[]) {
+    this.createConsistentMapping(gptNodes);
+  }
+
+  private createConsistentMapping(gptNodes: WorkflowNode[]): void {
+    const sortedNodes = [...gptNodes].sort((a, b) => {
+      const aTime = (a.data as any)?.createdAt || a.id;
+      const bTime = (b.data as any)?.createdAt || b.id;
+      return aTime.localeCompare(bTime);
+    });
+
+    console.log(`🎯 SINGLE SOURCE OF TRUTH: Creating GPT node mapping for ${sortedNodes.length} nodes`);
+
+    sortedNodes.forEach((node, index) => {
+      const nodeLabel = (node.data?.label as string) || (node.data?.config as any)?.label || '';
+      let gptNumber: number;
+
+      const labelMatch = nodeLabel.trim().match(/(\d+)/);
+      if (labelMatch) {
+        gptNumber = parseInt(labelMatch[1]);
+        console.log(`  📝 ${node.id} → GPT ${gptNumber} (from label: "${nodeLabel.trim()}")`);
+      } else {
+        gptNumber = index + 1;
+        console.log(`  📝 ${node.id} → GPT ${gptNumber} (sequential position)`);
+      }
+
+      this.nodeMapping.set(node.id, gptNumber);
+      this.reverseMapping.set(gptNumber, node.id);
+      
+      this.allMappings.push({
+        nodeId: node.id,
+        gptNumber,
+        label: nodeLabel.trim() || `GPT ${gptNumber}`,
+        originalIndex: index
+      });
+    });
+
+    console.log(`✅ GPT Numbering Map:`, Array.from(this.nodeMapping.entries()));
+  }
+
+  getGPTNumber(nodeId: string): number {
+    const number = this.nodeMapping.get(nodeId);
+    if (!number) {
+      console.error(`❌ No GPT number found for node ${nodeId}`);
+      return 1;
+    }
+    return number;
+  }
+
+  getAllRequiredNumbers(): number[] {
+    return Array.from(this.reverseMapping.keys()).sort((a, b) => a - b);
+  }
+
+  validateResults(accumulatedData: Record<string, unknown>): {
+    available: number[];
+    missing: number[];
+    isComplete: boolean;
+  } {
+    const required = this.getAllRequiredNumbers();
+    const available: number[] = [];
+    const missing: number[] = [];
+
+    required.forEach(num => {
+      const key = `GPT ${num}`;
+      const data = accumulatedData[key];
+      const result = (data as any)?.result;
+      
+      const isValid = data && 
+                     result !== undefined && 
+                     result !== null && 
+                     result !== '' && 
+                     (typeof result === 'string' ? result.trim().length > 0 : true);
+
+      if (isValid) {
+        available.push(num);
+        console.log(`   ✅ GPT ${num}: Available`);
+      } else {
+        missing.push(num);
+        console.log(`   ❌ GPT ${num}: Missing or invalid`);
+      }
+    });
+
+    return { available, missing, isComplete: missing.length === 0 };
+  }
+}
+
 serve(async (req) => {
   console.log('🚀 Webhook handler called!');
   console.log('Method:', req.method);
@@ -1059,71 +1158,25 @@ async function processWorkflowWithEarlyResponse(
       throw err;
     }
     
-    // ENHANCED: Helper function to extract proper node number from GPT nodes with better fallback logic
-    const getGPTNodeNumber = (node: WorkflowNode, allGptNodes: WorkflowNode[]): number => {
-      const nodeLabel = (node.data?.label as string) || (node.data?.config as any)?.label || '';
-      let nodeNumber: number | null = null;
-      
-      console.log(`🔍 Analyzing GPT node ${node.id} for number extraction:`, {
-        nodeId: node.id,
-        nodeLabel: nodeLabel.trim(),
-        hasNodeNumber: !!(node.data as any)?.nodeNumber,
-        nodeNumberValue: (node.data as any)?.nodeNumber
-      });
-      
-      // PRIORITY 1: Extract from node label (most reliable)
-      if (nodeLabel.trim()) {
-        const labelMatch = nodeLabel.trim().match(/(\d+)/);
-        if (labelMatch) {
-          nodeNumber = parseInt(labelMatch[1]);
-          console.log(`✅ Found number ${nodeNumber} from label: "${nodeLabel.trim()}"`);
-        }
-      }
-      
-      // PRIORITY 2: Use stored nodeNumber from data
-      if (!nodeNumber && (node.data as any)?.nodeNumber) {
-        nodeNumber = (node.data as any).nodeNumber as number;
-        console.log(`✅ Found number ${nodeNumber} from node.data.nodeNumber`);
-      }
-      
-      // PRIORITY 3: Extract from node ID
-      if (!nodeNumber) {
-        const idMatch = node.id.match(/(\d+)/);
-        if (idMatch) {
-          nodeNumber = parseInt(idMatch[1]);
-          console.log(`✅ Found number ${nodeNumber} from node ID: ${node.id}`);
-        }
-      }
-      
-      // PRIORITY 4: Use position in sorted GPT nodes array (deterministic fallback)
-      if (!nodeNumber) {
-        const gptIndex = allGptNodes.findIndex((n: WorkflowNode) => n.id === node.id);
-        nodeNumber = gptIndex >= 0 ? gptIndex + 1 : 1;
-        console.log(`✅ Using fallback position-based number ${nodeNumber} (index ${gptIndex})`);
-      }
-      
-      console.log(`🎯 Final GPT node number for ${node.id}: ${nodeNumber}`);
-      return nodeNumber;
-    };
-
-    // ENHANCED: Process all results with proper node numbering and retry logic
-    const failedTasks: string[] = [];
-    const successfulTasks: string[] = [];
-    const retryableTasks: string[] = [];
-    
-    // Get all GPT nodes for consistent numbering
+    // SINGLE SOURCE OF TRUTH: Create GPT numbering manager ONCE
     const allGptNodes = nodes
       .filter((n: WorkflowNode) => n.type === 'gptTask')
       .sort((a: WorkflowNode, b: WorkflowNode) => {
-        // Sort by creation time or ID for consistent ordering
         const aTime = (a.data as any)?.createdAt || a.id;
         const bTime = (b.data as any)?.createdAt || b.id;
         return aTime.localeCompare(bTime);
       });
     
-    console.log(`🧠 Found ${allGptNodes.length} total GPT nodes in workflow:`, 
-      allGptNodes.map(n => ({ id: n.id, label: (n.data?.label as string) || 'No label' }))
-    );
+    const gptManager = new GPTNumberingManager(allGptNodes);
+    
+    console.log('\n' + '='.repeat(80));
+    console.log('🎯 SINGLE SOURCE OF TRUTH: GPT NUMBERING SYSTEM');
+    console.log('='.repeat(80));
+    
+    // ENHANCED: Process all results with proper node numbering and retry logic
+    const failedTasks: string[] = [];
+    const successfulTasks: string[] = [];
+    const retryableTasks: string[] = [];
     
     for (const taskResult of allResults) {
       if (!taskResult) continue;
@@ -1204,22 +1257,22 @@ async function processWorkflowWithEarlyResponse(
           
           console.log(`💾 Stored HTTP result as "HTTP ${nodeIndex}"`);
         } else if (taskType === 'gptTask') {
-          // ENHANCED: For GPT tasks, use the ACTUAL node number from the workflow
-          const actualNodeNumber = getGPTNodeNumber(node, allGptNodes);
+          // USE SINGLE SOURCE OF TRUTH FOR GPT NUMBERING
+          const gptNumber = gptManager.getGPTNumber(nodeId);
           
           console.log(`🔍 GPT Node ${nodeId} Processing:`, {
             nodeId,
             nodeLabel: nodeLabel.trim(),
-            actualNodeNumber,
+            gptNumber,
             resultLength: typeof (safeNodeResult as any).result === 'string' ? (safeNodeResult as any).result.length : 'N/A',
             hasValidResult: hasValidContent
           });
           
-          // Store with the CORRECT node number and MULTIPLE reference patterns
+          // Store with CONSISTENT numbering using Single Source of Truth
           accumulatedWorkflowData[nodeId] = safeNodeResult;
-          accumulatedWorkflowData[`GPT ${actualNodeNumber}`] = safeNodeResult;
-          accumulatedWorkflowData[`GPT Task ${actualNodeNumber}`] = safeNodeResult;
-          accumulatedWorkflowData[`GPT${actualNodeNumber}`] = safeNodeResult; // No space variant
+          accumulatedWorkflowData[`GPT ${gptNumber}`] = safeNodeResult;
+          accumulatedWorkflowData[`GPT Task ${gptNumber}`] = safeNodeResult;
+          accumulatedWorkflowData[`GPT${gptNumber}`] = safeNodeResult; // No space variant
           
           // Store under label if exists
           if (typeof nodeLabel === 'string' && nodeLabel.trim()) {
@@ -1235,7 +1288,7 @@ async function processWorkflowWithEarlyResponse(
           const currentCount = nodeTypeCounts.get('gptTask') || 0;
           nodeTypeCounts.set('gptTask', currentCount + 1);
           
-          console.log(`💾 Stored GPT result as "GPT ${actualNodeNumber}" with content:`, 
+          console.log(`💾 Stored GPT result as "GPT ${gptNumber}" with content:`, 
             typeof (safeNodeResult as any).result === 'string' 
               ? `"${(safeNodeResult as any).result.substring(0, 50)}..." (${(safeNodeResult as any).result.length} chars)`
               : `Non-string result: ${typeof (safeNodeResult as any).result}`
@@ -1275,12 +1328,12 @@ async function processWorkflowWithEarlyResponse(
                                    ((safeNodeResult as any).result.trim?.() || '').length > 0;
             
             if (hasValidContent) {
-              // Store the retry result
-              const actualNodeNumber = getGPTNodeNumber(node, allGptNodes);
+              // Store the retry result using Single Source of Truth
+              const gptNumber = gptManager.getGPTNumber(nodeId);
               accumulatedWorkflowData[nodeId] = safeNodeResult;
-              accumulatedWorkflowData[`GPT ${actualNodeNumber}`] = safeNodeResult;
-              accumulatedWorkflowData[`GPT Task ${actualNodeNumber}`] = safeNodeResult;
-              accumulatedWorkflowData[`GPT${actualNodeNumber}`] = safeNodeResult;
+              accumulatedWorkflowData[`GPT ${gptNumber}`] = safeNodeResult;
+              accumulatedWorkflowData[`GPT Task ${gptNumber}`] = safeNodeResult;
+              accumulatedWorkflowData[`GPT${gptNumber}`] = safeNodeResult;
               
               // Remove from failed tasks and add to successful
               const failedIndex = failedTasks.findIndex(task => task.includes(nodeId));
@@ -1289,7 +1342,7 @@ async function processWorkflowWithEarlyResponse(
                 successfulTasks.push(`gptTask ${nodeId} (retry success)`);
               }
               
-              console.log(`✅ RETRY SUCCESS: GPT ${actualNodeNumber} (${nodeId}) completed on retry`);
+              console.log(`✅ RETRY SUCCESS: GPT ${gptNumber} (${nodeId}) completed on retry`);
             } else {
               console.log(`❌ RETRY FAILED: GPT task ${nodeId} retry completed but still has empty content`);
             }
@@ -1345,107 +1398,31 @@ async function processWorkflowWithEarlyResponse(
     console.log(`   Completed GPT tasks: ${actualGPTCount}`);
     console.log(`   Missing GPT tasks: ${expectedGPTCount - actualGPTCount}`);
     
-    // ENHANCED: Get the actual GPT nodes and determine required GPT numbers using consistent logic
-    const actualGPTNodes = allGptNodes; // Use the same sorted list we used for processing
-    const requiredGPTNumbers: number[] = [];
-    
-    console.log(`🧠 Determining required GPT numbers from ${actualGPTNodes.length} GPT nodes...`);
-    
-    // Extract the actual GPT numbers from the workflow nodes using the same logic
-    actualGPTNodes.forEach(node => {
-      const nodeNumber = getGPTNodeNumber(node, allGptNodes);
-      
-      if (nodeNumber && !requiredGPTNumbers.includes(nodeNumber)) {
-        requiredGPTNumbers.push(nodeNumber);
-        console.log(`📝 Required GPT ${nodeNumber} from node ${node.id}`);
-      }
-    });
-    
-    // Sort the required GPT numbers
-    requiredGPTNumbers.sort((a, b) => a - b);
-    
-    console.log(`   Required GPT numbers based on workflow: [${requiredGPTNumbers.join(', ')}]`);
-    
-    // Debug: Show all available keys in accumulated workflow data
-    const allGPTKeys = Object.keys(accumulatedWorkflowData).filter(key => key.startsWith('GPT'));
-    console.log(`   All GPT-related keys in workflow data: [${allGPTKeys.join(', ')}]`);
-    
-    // Debug: Show detailed content of each GPT key
-    allGPTKeys.forEach(key => {
-      const gptData = accumulatedWorkflowData[key];
-      const result = (gptData as any)?.result;
-      console.log(`   🔍 ${key}: ${result ? `"${String(result).substring(0, 30)}..." (${String(result).length} chars)` : 'MISSING/EMPTY'}`);
-    });
-    
-    // Debug: Show a sample of what's actually stored
-    console.log(`   Sample of accumulated workflow data keys: [${Object.keys(accumulatedWorkflowData).slice(0, 15).join(', ')}]`);
-    
-    const missingGPTResults: number[] = [];
-    const availableGPTResults: number[] = [];
-    
-    // Check each required GPT result - STRICT validation
-    requiredGPTNumbers.forEach(num => {
-      const gptKey = `GPT ${num}`;
-      const gptData = accumulatedWorkflowData[gptKey];
-      const gptResult = (gptData as Record<string, unknown>)?.result;
-      
-      // STRICT: Must have data, result property, and non-empty content
-      const isValidResult = gptData && 
-                           gptResult !== undefined && 
-                           gptResult !== null && 
-                           gptResult !== '' && 
-                           (typeof gptResult === 'string' ? gptResult.trim().length > 0 : true) && 
-                           gptResult !== undefined && 
-                           gptResult !== null;
-      
-      if (isValidResult) {
-        availableGPTResults.push(num);
-        console.log(`   ✅ GPT ${num}: Available (${typeof gptResult === 'string' 
-          ? gptResult.substring(0, 50) + '...'
-          : 'Non-string result'})`);
-      } else {
-        missingGPTResults.push(num);
-        console.log(`   ❌ GPT ${num}: Missing, empty, or invalid (result: ${gptResult})`);
-        
-        // Debug: Show what we actually have
-        if (gptData) {
-          console.log(`       Debug - GPT ${num} data:`, {
-            hasData: !!gptData,
-            hasResult: gptResult !== undefined,
-            resultType: typeof gptResult,
-            resultValue: gptResult,
-            resultLength: typeof gptResult === 'string' ? gptResult.length : 'N/A'
-          });
-        }
-      }
-    });
+    // VALIDATE USING SINGLE SOURCE OF TRUTH
+    console.log('\n' + '='.repeat(80));
+    console.log('🔍 VALIDATION USING SINGLE SOURCE OF TRUTH');
+    console.log('='.repeat(80));
 
-    console.log(`\n📋 GPT RESULTS STATUS:`);
-    console.log(`   ✅ Available: GPT ${availableGPTResults.join(', GPT ')}`);
-    if (missingGPTResults.length > 0) {
-      console.log(`   ❌ Missing: GPT ${missingGPTResults.join(', GPT ')}`);
+    const validation = gptManager.validateResults(accumulatedWorkflowData);
+    
+    console.log(`📊 Task Execution Results:`);
+    console.log(`   ✅ Successful tasks: ${successfulTasks.length}`);
+    console.log(`   ❌ Failed tasks: ${failedTasks.length}`);
+    console.log(`   📈 Success rate: ${Math.round((successfulTasks.length / allResults.length) * 100)}%`);
+    
+    console.log(`\n🧠 GPT RESULTS VALIDATION:`);
+    console.log(`   Required GPT numbers: [${gptManager.getAllRequiredNumbers().join(', ')}]`);
+    console.log(`   ✅ Available: GPT ${validation.available.join(', GPT ')}`);
+    if (validation.missing.length > 0) {
+      console.log(`   ❌ Missing: GPT ${validation.missing.join(', GPT ')}`);
     }
+    console.log(`   Complete: ${validation.isComplete ? '✅ YES' : '❌ NO'}`);
 
-    // CRITICAL: Check if ALL required GPT results are available
-    const allGPTResultsAvailable = missingGPTResults.length === 0;
-    
-    console.log(`\n🎯 WEBHOOK RESPONSE VALIDATION:`);
-    console.log(`   All GPT results available: ${allGPTResultsAvailable ? '✅ YES' : '❌ NO'}`);
-    console.log(`   Missing results count: ${missingGPTResults.length}`);
-    
-    // STRICT ALL-OR-NOTHING VALIDATION: Block ANY incomplete results
-    const gptSuccessRate = availableGPTResults.length / requiredGPTNumbers.length;
-    
-    console.log(`   GPT Success Rate: ${Math.round(gptSuccessRate * 100)}%`);
-    console.log(`   Required: 100% (ALL GPT results must be present and valid)`);
-    
-    if (!allGPTResultsAvailable) {
+    // STRICT ALL-OR-NOTHING VALIDATION
+    if (!validation.isComplete) {
       console.log(`\n🚨 BLOCKING WEBHOOK RESPONSE - INCOMPLETE RESULTS:`);
-      console.log(`   Missing/Invalid: GPT ${missingGPTResults.join(', GPT ')}`);
-      console.log(`   Available: GPT ${availableGPTResults.join(', GPT ')}`);
-      console.log(`   Success Rate: ${Math.round(gptSuccessRate * 100)}%`);
-      console.log(`   Reason: ALL GPT results must be present and contain valid content`);
-      console.log(`   Action: Blocking response to prevent partial/invalid data to Make.com`);
+      console.log(`   Missing: GPT ${validation.missing.join(', GPT ')}`);
+      console.log(`   Reason: ALL GPT results must be present and valid`);
       console.log(`   Note: Empty strings, null, or undefined results are considered invalid`);
       
       // Update execution status to indicate incomplete results
@@ -1454,20 +1431,19 @@ async function processWorkflowWithEarlyResponse(
           .from('workflow_executions')
           .update({
             status: 'incomplete',
-            error_message: `Incomplete GPT results: Missing or invalid GPT ${missingGPTResults.join(', GPT ')}`,
+            error_message: `Incomplete GPT results: Missing GPT ${validation.missing.join(', GPT ')}`,
             error_details: {
-              missing_gpt_results: missingGPTResults,
-              available_gpt_results: availableGPTResults,
-              success_rate: gptSuccessRate,
-              total_expected: requiredGPTNumbers.length,
-              total_completed: availableGPTResults.length,
-              validation_mode: 'strict_all_or_nothing'
+              missing_gpt_results: validation.missing,
+              available_gpt_results: validation.available,
+              total_expected: gptManager.getAllRequiredNumbers().length,
+              total_completed: validation.available.length,
+              validation_mode: 'single_source_of_truth'
             }
           })
           .eq('id', executionId);
       }
       
-      throw new Error(`Incomplete workflow results: Missing or invalid GPT ${missingGPTResults.join(', GPT ')}. ALL GPT results must be present and contain valid content. No partial responses allowed.`);
+      throw new Error(`Incomplete workflow results: Missing GPT ${validation.missing.join(', GPT ')}. ALL GPT results must be present and valid. No partial responses allowed.`);
     }
 
     console.log(`\n✅ ALL VALIDATIONS PASSED - Proceeding with webhook response`);
