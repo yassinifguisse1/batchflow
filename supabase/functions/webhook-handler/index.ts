@@ -148,8 +148,8 @@ serve(async (req) => {
   
   try {
     // Initialize Supabase client
-    const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
-    const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
+    const supabaseUrl = Deno.env.get('VITE_SUPABASE_URL')!;
+    const supabaseServiceKey = Deno.env.get('VITE_SUPABASE_PUBLISHABLE_KEY')!;
     const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
     // Extract webhook path from URL
