@@ -15,7 +15,7 @@ import AuthDialog from '@/components/auth/AuthDialog';
 interface CreateWebhookDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  onSave?: (webhookData: any) => void;
+  onSave?: (webhookData: unknown) => void;
 }
 
 const CreateWebhookDialog: React.FC<CreateWebhookDialogProps> = ({
@@ -111,7 +111,7 @@ const CreateWebhookDialog: React.FC<CreateWebhookDialogProps> = ({
       }
 
       // Generate the full webhook URL
-      const webhookUrl = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/webhook-handler/${urlPath}`;
+      const webhookUrl = `${import.meta.env.SUPABASE_URL}/functions/v1/webhook-handler/${urlPath}`;
 
       toast({
         title: "Webhook created successfully!",
@@ -135,11 +135,11 @@ const CreateWebhookDialog: React.FC<CreateWebhookDialogProps> = ({
       setApiKeys([{ id: 1, name: 'API key 1', key: '', header: 'x-make-apikey' }]);
       onOpenChange(false);
 
-    } catch (error: any) {
+    } catch (error: unknown) {
       console.error('Error creating webhook:', error);
       toast({
         title: "Error creating webhook",
-        description: error.message || "An unexpected error occurred.",
+        description: error instanceof Error ? error.message : "An unexpected error occurred.",
         variant: "destructive"
       });
     } finally {

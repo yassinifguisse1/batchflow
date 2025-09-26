@@ -65,7 +65,7 @@ const WebhookConfig: React.FC<WebhookConfigProps> = ({ webhook, onSave, onCancel
   const [showApiKeyForm, setShowApiKeyForm] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const [listeningWebhookId, setListeningWebhookId] = useState<string | null>(null);
-  const [determinedStructure, setDeterminedStructure] = useState<any>(null);
+  const [determinedStructure, setDeterminedStructure] = useState<unknown>(null);
   const { toast } = useToast();
   const { user } = useAuth();
 
@@ -102,7 +102,7 @@ const WebhookConfig: React.FC<WebhookConfigProps> = ({ webhook, onSave, onCancel
       const formattedWebhooks = (data || []).map(webhook => ({
         id: webhook.id,
         name: webhook.name,
-          url: `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/webhook-handler/${webhook.url_path}`,
+        url: `${import.meta.env.SUPABASE_URL}/functions/v1/webhook-handler/${webhook.url_path}`,
         url_path: webhook.url_path
       }));
 
@@ -349,10 +349,10 @@ const WebhookConfig: React.FC<WebhookConfigProps> = ({ webhook, onSave, onCancel
     }, 300000);
   };
 
-  const analyzeDataStructure = (data: any): any => {
+  const analyzeDataStructure = (data: unknown): unknown => {
     if (!data || typeof data !== 'object') return null;
     
-    const analyzeValue = (value: any, path: string = ''): any => {
+    const analyzeValue = (value: unknown, path: string = ''): unknown => {
       if (Array.isArray(value)) {
         return {
           type: 'array',
@@ -360,7 +360,7 @@ const WebhookConfig: React.FC<WebhookConfigProps> = ({ webhook, onSave, onCancel
           description: `Array of ${value.length} items`
         };
       } else if (typeof value === 'object' && value !== null) {
-        const properties: any = {};
+        const properties: unknown = {};
         Object.keys(value).forEach(key => {
           properties[key] = analyzeValue(value[key], path ? `${path}.${key}` : key);
         });

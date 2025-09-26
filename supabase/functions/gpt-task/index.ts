@@ -146,6 +146,7 @@ serve(async (req) => {
       top_p: config.top_p || 1,
       stream: config.stream || false
     };
+    console.log('OpenAI request payload:', openAIPayload);
 
     // Handle max tokens parameter - newer models use max_completion_tokens
     const isNewerModel = selectedModel.includes('gpt-5') || 

@@ -19,7 +19,7 @@ import { useToast } from '@/hooks/use-toast';
 
 interface NodeConfigPanelProps {
   node: Node;
-  onUpdate: (updates: any) => void;
+  onUpdate: (updates: unknown) => void;
 }
 
 interface NodeConfig {
@@ -549,7 +549,7 @@ const NodeConfigPanel: React.FC<NodeConfigPanelProps> = ({ node, onUpdate }) => 
   };
 
   const selectedWebhook = webhooks.find(w => w.id === config.selectedHook);
-  const webhookUrl = selectedWebhook ? `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/webhook-handler/${selectedWebhook.url_path}` : '';
+  const webhookUrl = selectedWebhook ? `${import.meta.env.SUPABASE_URL}/functions/v1/webhook-handler/${selectedWebhook.url_path}` : '';
 
   const copyToClipboard = () => {
     if (webhookUrl) {
@@ -656,10 +656,10 @@ const NodeConfigPanel: React.FC<NodeConfigPanelProps> = ({ node, onUpdate }) => 
     }, 300000);
   };
 
-  const analyzeDataStructure = (data: any): any => {
+  const analyzeDataStructure = (data: unknown): unknown => {
     if (!data || typeof data !== 'object') return null;
     
-    const analyzeValue = (value: any, path: string = ''): any => {
+    const analyzeValue = (value: unknown, path: string = ''): unknown => {
       if (Array.isArray(value)) {
         return {
           type: 'array',
@@ -667,7 +667,7 @@ const NodeConfigPanel: React.FC<NodeConfigPanelProps> = ({ node, onUpdate }) => 
           description: `Array of ${value.length} items`
         };
       } else if (typeof value === 'object' && value !== null) {
-        const properties: any = {};
+        const properties: unknown = {};
         Object.keys(value).forEach(key => {
           properties[key] = analyzeValue(value[key], path ? `${path}.${key}` : key);
         });
