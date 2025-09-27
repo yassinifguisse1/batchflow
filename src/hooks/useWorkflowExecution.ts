@@ -146,14 +146,16 @@ export const useWorkflowExecution = (allNodes: any[] = [], allEdges: any[] = [])
               status,
               executedNodes: executedNodeIds,
               currentNodeId,
-              nodeResultsCount: Object.keys(nodeResults).length
+              nodeResultsCount: Object.keys(nodeResults).length,
+              totalNodesInWorkflow: allNodes.length,
+              nodeTypes: allNodes.map(n => ({ id: n.id, type: n.type }))
             });
 
             setExecutionState(prev => ({
               ...prev,
               currentExecutionId: execution.id,
               executedNodes: executedNodeIds,
-              currentNodeId,
+              currentNodeId: status === 'completed' ? null : currentNodeId, // Clear current node when completed
               status,
               nodeResults,
               isRunning: status === 'running',
@@ -162,39 +164,76 @@ export const useWorkflowExecution = (allNodes: any[] = [], allEdges: any[] = [])
               error: status === 'failed' ? execution.error_message : null
             }));
 
+            console.log('🔄 Updated execution state:', {
+              status,
+              isRunning: status === 'running',
+              executedNodes: executedNodeIds.length,
+              currentNodeId: status === 'completed' ? null : currentNodeId
+            });
+
             // Generate node updates for all nodes
             const updates: NodeUpdate[] = [];
             
             // Update all nodes based on execution state
             if (status === 'completed') {
-              // All executed nodes should be completed
+              // FORCE ALL EXECUTED NODES TO COMPLETED - no exceptions
+              console.log('🎯 WORKFLOW COMPLETED - Forcing ALL executed nodes to completed status');
+              
               executedNodeIds.forEach(nodeId => {
-                const hasValidResult = nodeResults[nodeId] && 
-                  nodeResults[nodeId].result !== undefined && 
-                  nodeResults[nodeId].result !== null && 
-                  nodeResults[nodeId].result !== '';
+                const nodeResult = nodeResults[nodeId];
+                // More flexible result validation - check if node has any meaningful result
+                const hasValidResult = nodeResult && (
+                  nodeResult.result !== undefined || 
+                  nodeResult.response !== undefined ||
+                  nodeResult.webhook_response !== undefined ||
+                  Object.keys(nodeResult).length > 0
+                );
+                
+                console.log(`🔍 Node ${nodeId} result validation:`, { 
+                  nodeResult, 
+                  hasValidResult,
+                  resultKeys: nodeResult ? Object.keys(nodeResult) : []
+                });
                 
                 updates.push({
                   nodeId,
-                  status: hasValidResult ? 'completed' : 'error',
+                  status: 'completed', // If workflow completed successfully, all executed nodes are completed
                   hasResult: hasValidResult,
-                  executionResult: nodeResults[nodeId],
+                  executionResult: nodeResult,
                   hasCompletedExecution: true
                 });
               });
+
+              // ALSO force the current node (usually webhook response) to completed
+              if (currentNodeId && !executedNodeIds.includes(currentNodeId)) {
+                console.log(`🎯 FORCING current node ${currentNodeId} to completed (usually webhook response)`);
+                const nodeResult = nodeResults[currentNodeId];
+                const hasValidResult = nodeResult && Object.keys(nodeResult).length > 0;
+                
+                updates.push({
+                  nodeId: currentNodeId,
+                  status: 'completed',
+                  hasResult: hasValidResult,
+                  executionResult: nodeResult,
+                  hasCompletedExecution: true
+                });
+              }
             } else if (status === 'running') {
               // Current node is running, executed nodes are completed
               executedNodeIds.forEach(nodeId => {
-                const hasValidResult = nodeResults[nodeId] && 
-                  nodeResults[nodeId].result !== undefined && 
-                  nodeResults[nodeId].result !== null && 
-                  nodeResults[nodeId].result !== '';
+                const nodeResult = nodeResults[nodeId];
+                const hasValidResult = nodeResult && (
+                  nodeResult.result !== undefined || 
+                  nodeResult.response !== undefined ||
+                  nodeResult.webhook_response !== undefined ||
+                  Object.keys(nodeResult).length > 0
+                );
                 
                 updates.push({
                   nodeId,
-                  status: nodeId === currentNodeId ? 'running' : (hasValidResult ? 'completed' : 'error'),
+                  status: nodeId === currentNodeId ? 'running' : 'completed',
                   hasResult: hasValidResult,
-                  executionResult: nodeResults[nodeId],
+                  executionResult: nodeResult,
                   hasCompletedExecution: nodeId !== currentNodeId
                 });
               });
@@ -211,6 +250,34 @@ export const useWorkflowExecution = (allNodes: any[] = [], allEdges: any[] = [])
             }
 
             setNodeUpdates(updates);
+
+            // AGGRESSIVE: Also trigger individual node updates for completion
+            if (status === 'completed') {
+              console.log('🚀 AGGRESSIVE COMPLETION: Triggering individual node updates');
+              setTimeout(() => {
+                // Force update all nodes that should be completed
+                const allNodesToComplete = [...executedNodeIds];
+                if (currentNodeId && !executedNodeIds.includes(currentNodeId)) {
+                  allNodesToComplete.push(currentNodeId);
+                }
+                
+                allNodesToComplete.forEach(nodeId => {
+                  const nodeResult = nodeResults[nodeId];
+                  setNodeUpdates(prev => {
+                    const existingUpdate = prev.find(u => u.nodeId === nodeId);
+                    if (existingUpdate && existingUpdate.status !== 'completed') {
+                      console.log(`🔄 FORCING node ${nodeId} status to completed (was ${existingUpdate.status})`);
+                      return prev.map(u => u.nodeId === nodeId ? {
+                        ...u,
+                        status: 'completed',
+                        hasCompletedExecution: true
+                      } : u);
+                    }
+                    return prev;
+                  });
+                });
+              }, 100); // Small delay to ensure all updates are processed
+            }
 
             // Enhanced toast messages
             if (status === 'completed') {

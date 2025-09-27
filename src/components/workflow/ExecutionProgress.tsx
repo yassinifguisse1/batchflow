@@ -15,6 +15,7 @@ interface ExecutionProgressProps {
   endTime: Date | null;
   error?: string | null;
   className?: string;
+  allNodes?: any[]; // Add nodes data to convert IDs to friendly names
 }
 
 const ExecutionProgress: React.FC<ExecutionProgressProps> = ({
@@ -26,7 +27,8 @@ const ExecutionProgress: React.FC<ExecutionProgressProps> = ({
   startTime,
   endTime,
   error,
-  className
+  className,
+  allNodes = []
 }) => {
   const progress = totalNodes > 0 ? (executedNodes.length / totalNodes) * 100 : 0;
   const duration = startTime && endTime ? endTime.getTime() - startTime.getTime() : null;
@@ -72,7 +74,42 @@ const ExecutionProgress: React.FC<ExecutionProgressProps> = ({
   const formatDuration = (ms: number) => {
     if (ms < 1000) return `${ms}ms`;
     if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
-    return `${(ms / 60000).toFixed(1)}m`;
+    // Only show minutes if it's actually over 60 seconds
+    const minutes = Math.floor(ms / 60000);
+    const seconds = Math.floor((ms % 60000) / 1000);
+    if (minutes > 0) {
+      return `${minutes}m ${seconds}s`;
+    }
+    return `${(ms / 1000).toFixed(1)}s`;
+  };
+
+  // Convert node ID to friendly name
+  const getNodeFriendlyName = (nodeId: string) => {
+    const node = allNodes.find(n => n.id === nodeId);
+    if (!node) return nodeId;
+
+    // Handle different node types
+    if (node.type === 'trigger') {
+      return 'Webhook Trigger';
+    } else if (node.type === 'gptTask') {
+      // Extract GPT number from label or data
+      const label = node.data?.label || node.data?.config?.label || '';
+      const gptNumberMatch = label.match(/GPT\s*(\d+)/i);
+      if (gptNumberMatch) {
+        return `GPT ${gptNumberMatch[1]}`;
+      }
+      // Fallback: use node number if available
+      if (node.data?.nodeNumber) {
+        return `GPT ${node.data.nodeNumber}`;
+      }
+      return 'GPT Task';
+    } else if (node.type === 'webhookResponse') {
+      return 'Response';
+    } else if (node.type === 'httpTask') {
+      return 'HTTP Task';
+    }
+    
+    return node.data?.label || node.type || nodeId;
   };
 
   return (
@@ -163,8 +200,9 @@ const ExecutionProgress: React.FC<ExecutionProgressProps> = ({
                   key={nodeId} 
                   variant="secondary" 
                   className="text-xs"
+                  title={nodeId} // Show full node ID on hover
                 >
-                  {nodeId}
+                  {getNodeFriendlyName(nodeId)}
                 </Badge>
               ))}
             </div>

@@ -180,7 +180,7 @@ const FlowBatchBuilder = () => {
         return currentNodes.map(node => {
           const update = nodeUpdates.find(u => u.nodeId === node.id);
           if (update) {
-            console.log(`🔄 Updating node ${node.id}:`, update);
+            console.log(`🔄 FORCE Updating node ${node.id} from ${node.data?.status || 'undefined'} to ${update.status}:`, update);
             return {
               ...node,
               data: {
@@ -188,7 +188,9 @@ const FlowBatchBuilder = () => {
                 status: update.status,
                 hasResult: update.hasResult || false,
                 executionResult: update.executionResult,
-                hasCompletedExecution: update.hasCompletedExecution || false
+                hasCompletedExecution: update.hasCompletedExecution || false,
+                // Force re-render by updating timestamp
+                lastUpdated: Date.now()
               }
             };
           }
@@ -197,6 +199,36 @@ const FlowBatchBuilder = () => {
       });
     }
   }, [nodeUpdates, setNodes]);
+
+  // AGGRESSIVE: Force completion of all nodes when execution completes
+  useEffect(() => {
+    if (executionState.status === 'completed' && !executionState.isRunning) {
+      console.log('🎯 WORKFLOW COMPLETED - Force updating all executed nodes to completed');
+      
+      setTimeout(() => {
+        setNodes((currentNodes) => {
+          return currentNodes.map(node => {
+            const isExecuted = executionState.executedNodes.includes(node.id);
+            const isCurrentNode = executionState.currentNodeId === node.id;
+            
+            if (isExecuted || isCurrentNode) {
+              console.log(`🔄 FORCE COMPLETING node ${node.id} (type: ${node.type})`);
+              return {
+                ...node,
+                data: {
+                  ...node.data,
+                  status: 'completed',
+                  hasCompletedExecution: true,
+                  lastUpdated: Date.now()
+                }
+              };
+            }
+            return node;
+          });
+        });
+      }, 500); // Delay to ensure all other updates are processed first
+    }
+  }, [executionState.status, executionState.isRunning, executionState.executedNodes, executionState.currentNodeId, setNodes]);
   
   // Debug parallelMode changes
   React.useEffect(() => {
@@ -2204,18 +2236,19 @@ const FlowBatchBuilder = () => {
                   </div>
                 )}
 
-                {/* Execution Progress - Show when workflow is running */}
-                {executionState.isRunning && (
+                {/* Execution Progress - Show when workflow is running or recently completed */}
+                {(executionState.isRunning || (executionState.status === 'completed' && Date.now() - (executionState.endTime?.getTime() || 0) < 5000)) && (
                   <div className="absolute top-4 right-4 z-20 w-80">
                     <ExecutionProgress
                       isRunning={executionState.isRunning}
                       status={executionState.status}
                       executedNodes={executionState.executedNodes}
                       currentNodeId={executionState.currentNodeId}
-                      totalNodes={nodes.length}
+                      totalNodes={nodes.filter(n => n.type !== 'trigger').length}
                       startTime={executionState.startTime}
                       endTime={executionState.endTime}
                       error={executionState.error}
+                      allNodes={nodes}
                     />
                   </div>
                 )}
