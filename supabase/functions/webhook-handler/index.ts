@@ -587,8 +587,8 @@ serve(async (req) => {
     console.log(`Webhook processed successfully in ${finalProcessingTime}ms`);
 
     // Return custom response if workflow has webhook response node
-    if ((workflowResult as any)?.hasWebhookResponse && (workflowResult as any).webhookResponse) {
-      const webhookResponse = (workflowResult as any).webhookResponse;
+    if ((workflowResult )?.hasWebhookResponse && (workflowResult ).webhookResponse) {
+      const webhookResponse = (workflowResult ).webhookResponse;
       
       // Handle error responses in webhook response
       if (webhookResponse.error) {
@@ -1162,8 +1162,8 @@ async function processWorkflowWithEarlyResponse(
     const allGptNodes = nodes
       .filter((n: WorkflowNode) => n.type === 'gptTask')
       .sort((a: WorkflowNode, b: WorkflowNode) => {
-        const aTime = (a.data as any)?.createdAt || a.id;
-        const bTime = (b.data as any)?.createdAt || b.id;
+        const aTime = (a.data )?.createdAt || a.id;
+        const bTime = (b.data )?.createdAt || b.id;
         return aTime.localeCompare(bTime);
       });
     
@@ -1188,7 +1188,7 @@ async function processWorkflowWithEarlyResponse(
         console.error(`❌ ${taskType} task ${nodeId} failed after ${(retryCount || 0) + 1} attempts`);
         
         // Check if this is a retryable failure (not a timeout or configuration error)
-        const errorMessage = (result as any)?.error || `${taskType} task failed`;
+        const errorMessage = (result )?.error || `${taskType} task failed`;
         const isRetryable = !errorMessage.includes('timeout') && 
                            !errorMessage.includes('configuration') && 
                            !errorMessage.includes('invalid');
@@ -1221,12 +1221,12 @@ async function processWorkflowWithEarlyResponse(
       // Store result with proper indexing based on actual node numbers
       if (result && typeof result === 'object') {
         const safeNodeResult = JSON.parse(JSON.stringify(result));
-        const nodeLabel = (node.data?.label as string) || (node.data?.config as any)?.label || '';
+        const nodeLabel = (node.data?.label as string) || (node.data?.config )?.label || '';
         
         // Validate that the result has actual content
-        const hasValidContent = (safeNodeResult as any).result && 
-                               (safeNodeResult as any).result !== '' && 
-                               ((safeNodeResult as any).result.trim?.() || '').length > 0;
+        const hasValidContent = (safeNodeResult ).result && 
+                               (safeNodeResult ).result !== '' && 
+                               ((safeNodeResult ).result.trim?.() || '').length > 0;
         
         if (!hasValidContent) {
           console.warn(`⚠️ ${taskType} ${nodeId} completed but has empty result content`);
@@ -1264,7 +1264,7 @@ async function processWorkflowWithEarlyResponse(
             nodeId,
             nodeLabel: nodeLabel.trim(),
             gptNumber,
-            resultLength: typeof (safeNodeResult as any).result === 'string' ? (safeNodeResult as any).result.length : 'N/A',
+            resultLength: typeof (safeNodeResult ).result === 'string' ? (safeNodeResult ).result.length : 'N/A',
             hasValidResult: hasValidContent
           });
           
@@ -1289,9 +1289,9 @@ async function processWorkflowWithEarlyResponse(
           nodeTypeCounts.set('gptTask', currentCount + 1);
           
           console.log(`💾 Stored GPT result as "GPT ${gptNumber}" with content:`, 
-            typeof (safeNodeResult as any).result === 'string' 
-              ? `"${(safeNodeResult as any).result.substring(0, 50)}..." (${(safeNodeResult as any).result.length} chars)`
-              : `Non-string result: ${typeof (safeNodeResult as any).result}`
+            typeof (safeNodeResult ).result === 'string' 
+              ? `"${(safeNodeResult ).result.substring(0, 50)}..." (${(safeNodeResult ).result.length} chars)`
+              : `Non-string result: ${typeof (safeNodeResult ).result}`
           );
         }
       } else {
@@ -1304,7 +1304,13 @@ async function processWorkflowWithEarlyResponse(
     if (retryableTasks.length > 0 && failedTasks.length > 0) {
       console.log(`\n🔄 AUTOMATIC RETRY: Attempting to retry ${retryableTasks.length} failed GPT tasks...`);
       
-      const retryPromises: Promise<any>[] = [];
+      const retryPromises: Promise<{
+        nodeId: string;
+        node: WorkflowNode;
+        result: unknown;
+        failed?: boolean;
+        taskType: 'httpTask' | 'gptTask';
+      } | null>[] = [];
       
       for (const nodeId of retryableTasks) {
         const retryTask = executeParallelTask(nodeId, nodes, accumulatedWorkflowData, executedNodes, executionId, supabase, 'gptTask');
@@ -1323,9 +1329,9 @@ async function processWorkflowWithEarlyResponse(
             const safeNodeResult = JSON.parse(JSON.stringify(result));
             
             // Validate retry result has content
-            const hasValidContent = (safeNodeResult as any).result && 
-                                   (safeNodeResult as any).result !== '' && 
-                                   ((safeNodeResult as any).result.trim?.() || '').length > 0;
+            const hasValidContent = (safeNodeResult ).result && 
+                                   (safeNodeResult ).result !== '' && 
+                                   ((safeNodeResult ).result.trim?.() || '').length > 0;
             
             if (hasValidContent) {
               // Store the retry result using Single Source of Truth

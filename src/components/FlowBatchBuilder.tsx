@@ -35,6 +35,9 @@ import NodeSettingsDialog from './workflow/NodeSettingsDialog';
 import WebhookConfig from './webhook/WebhookConfig';
 import CustomEdge from './workflow/CustomEdge';
 import WorkflowHistorySidebar from './workflow/WorkflowHistorySidebar';
+import { useWorkflowExecution } from '@/hooks/useWorkflowExecution';
+import ExecutionProgress from './workflow/ExecutionProgress';
+import NodeStatusIndicator from './workflow/NodeStatusIndicator';
 
 const nodeTypes = {
   gptTask: GPTTaskNode,
@@ -138,6 +141,62 @@ const FlowBatchBuilder = () => {
   const [sidebarOpen, setSidebarOpen] = useState(false); // Start collapsed in workflow mode
   const [executionHistory, setExecutionHistory] = useState<WorkflowExecution[]>([]);
   const [parallelMode, setParallelMode] = useState(false);
+  
+  // Centralized execution tracking
+  const {
+    executionState,
+    nodeUpdates,
+    getNodeStatus,
+    resetExecution,
+    markConnectedNodesAsRunning
+  } = useWorkflowExecution(nodes, edges);
+
+  // Enhanced node update handler using centralized execution state
+  const handleNodeUpdate = useCallback((nodeId: string, updateData: any) => {
+    console.log(`🔄 Updating node ${nodeId} with data:`, updateData);
+    
+    setNodes((currentNodes) => {
+      return currentNodes.map(node => {
+        if (node.id === nodeId) {
+          return {
+            ...node,
+            data: {
+              ...node.data,
+              ...updateData
+            }
+          };
+        }
+        return node;
+      });
+    });
+  }, [setNodes]);
+
+  // Update nodes with centralized execution state
+  useEffect(() => {
+    if (nodeUpdates.length > 0) {
+      console.log(`🔄 Applying ${nodeUpdates.length} node updates from centralized execution state`);
+      
+      setNodes((currentNodes) => {
+        return currentNodes.map(node => {
+          const update = nodeUpdates.find(u => u.nodeId === node.id);
+          if (update) {
+            console.log(`🔄 Updating node ${node.id}:`, update);
+            return {
+              ...node,
+              data: {
+                ...node.data,
+                status: update.status,
+                hasResult: update.hasResult || false,
+                executionResult: update.executionResult,
+                hasCompletedExecution: update.hasCompletedExecution || false
+              }
+            };
+          }
+          return node;
+        });
+      });
+    }
+  }, [nodeUpdates, setNodes]);
   
   // Debug parallelMode changes
   React.useEffect(() => {
@@ -666,17 +725,7 @@ const FlowBatchBuilder = () => {
     });
   }, [nodes, setNodes, toast, nextNodeNumber]);
 
-  // Handle node updates for real-time status changes
-  const handleNodeUpdate = useCallback((nodeId: string, updates: any) => {
-    console.log('🔄 FlowBatchBuilder: Updating node', nodeId, 'with updates:', updates);
-    setNodes(prevNodes => prevNodes.map(n => n.id === nodeId ? {
-      ...n,
-      data: {
-        ...n.data,
-        ...updates
-      }
-    } : n));
-  }, []);
+  // Note: handleNodeUpdate is now defined earlier with centralized execution state
 
   // Memoize nodeTypes to prevent React Flow warnings and context menu issues
   const memoizedNodeTypes = useMemo(() => {
@@ -720,7 +769,7 @@ const FlowBatchBuilder = () => {
           <ArrayAggregatorNode {...props} data={{...props.data, onNodeUpdate: handleNodeUpdate}} />
         </NodeContextMenu>
     };
-  }, [handleRunSingle, handleAddErrorHandler, handleRenameNode, duplicateNode, handleCopyModule, handleAddNote, removeNode, handleNodeSettings, setNodes]);
+  }, [handleRunSingle, handleAddErrorHandler, handleRenameNode, duplicateNode, handleCopyModule, handleAddNote, removeNode, handleNodeSettings, setNodes, handleNodeUpdate]);
   const onConnect = useCallback((params: Connection) => {
     const newEdge: Edge = {
       ...params,
@@ -2152,6 +2201,22 @@ const FlowBatchBuilder = () => {
                         Execution Start
                       </span>
                     </div>
+                  </div>
+                )}
+
+                {/* Execution Progress - Show when workflow is running */}
+                {executionState.isRunning && (
+                  <div className="absolute top-4 right-4 z-20 w-80">
+                    <ExecutionProgress
+                      isRunning={executionState.isRunning}
+                      status={executionState.status}
+                      executedNodes={executionState.executedNodes}
+                      currentNodeId={executionState.currentNodeId}
+                      totalNodes={nodes.length}
+                      startTime={executionState.startTime}
+                      endTime={executionState.endTime}
+                      error={executionState.error}
+                    />
                   </div>
                 )}
 

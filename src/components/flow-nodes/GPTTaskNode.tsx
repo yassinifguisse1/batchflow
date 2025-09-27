@@ -8,6 +8,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from 
 import GPTTaskConfig from '../GPTTaskConfig';
 import ExecutionNotification from '../workflow/ExecutionNotification';
 import ExecutionResultDialog from '../workflow/ExecutionResultDialog';
+import NodeStatusIndicator from '../workflow/NodeStatusIndicator';
 import { supabase } from '@/integrations/supabase/client';
 import { useToast } from '@/hooks/use-toast';
 const GPTTaskNode = memo(({
@@ -207,6 +208,17 @@ const GPTTaskNode = memo(({
           </div>
         )}
         
+        {/* Enhanced Status Indicator */}
+        <div className="absolute top-2 right-2 z-10">
+          <NodeStatusIndicator
+            status={data.status || 'idle'}
+            hasResult={!!data.executionResult}
+            hasCompletedExecution={data.hasCompletedExecution}
+            size="sm"
+            showLabel={false}
+          />
+        </div>
+
         {/* Execution notification - show when node has results or completed execution */}
         {(() => {
           const hasResult = !!data.executionResult; // consider any executionResult as content
